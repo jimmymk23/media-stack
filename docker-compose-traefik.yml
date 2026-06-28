@@ -1,7 +1,7 @@
 version: "3.3"
 services:
   traefik:
-    image: traefik:v2.11.20
+    image: traefik:v3.6.13
     container_name: traefik
     command:
 
@@ -47,4 +47,4 @@ networks:
 
 # Generate HASHED_ADMIN_USER_PASS using below command
 # htpasswd -B -C 10 -c .htpasswd user1
-# cat .htpasswd | sed -e s/\\$/\\$\\$/g
+# cat .htpasswd | sed -e s/\\\\$/\\\\$\\\\$/g
