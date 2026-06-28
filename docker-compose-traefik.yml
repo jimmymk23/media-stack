@@ -1,21 +1,26 @@
 version: "3.3"
 services:
   traefik:
-    image: traefik:v2.11.20
+    image: traefik:v3.6.13
     container_name: traefik
     command:
-
+      # - --log.level=DEBUG
       - --api.dashboard=true
       - --providers.docker=true
+      - --providers.docker.network=mynetwork
       - --accesslog=true
       - --providers.docker.exposedbydefault=false
-      - --providers.docker.network=mynetwork
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      - --entrypoints.web.http.redirections.entryPoint.permanent=true
       - --certificatesresolvers.le.acme.email=${LE_EMAIL}
       - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
       - --certificatesresolvers.le.acme.httpChallenge.entrypoint=web
       - --certificatesresolvers.le.acme.httpChallenge=true
+      - --entrypoints.websecure.transport.respondingTimeouts.readTimeout=0
+      - --entrypoints.websecure.transport.respondingTimeouts.idleTimeout=0
       - "--certificatesresolvers.le.acme.preferredChain=ISRG Root X1"
     restart: unless-stopped
     ports:
@@ -24,6 +29,7 @@ services:
     labels:
       - traefik.enable=true
       - traefik.http.routers.traefik.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.traefik.entryPoints=websecure
       - traefik.http.routers.traefik.tls=true
       - traefik.http.routers.traefik.tls.certresolver=le
       - traefik.http.routers.traefik.service=api@internal
@@ -47,4 +53,4 @@ networks:
 
 # Generate HASHED_ADMIN_USER_PASS using below command
 # htpasswd -B -C 10 -c .htpasswd user1
-# cat .htpasswd | sed -e s/\\$/\\$\\$/g
+# cat .htpasswd | sed -e s/\$/\$\$/g
