@@ -1,5 +1,16 @@
 version: "3.9"
 name: media-stack
+
+## Storage layout: two host paths are required (no defaults, since they're host-specific).
+##   MEDIA_DATA_DIR - primary storage (fast disk). Mounted as a SINGLE bind mount at /data
+##                     into qbittorrent, radarr, sonarr, jellyfin so downloads (/data/torrents)
+##                     and the library (/data/media) share one filesystem. This is what makes
+##                     Radarr/Sonarr's "Use Hardlinks instead of Copy" import (Settings > Media
+##                     Management) instant instead of a real file copy.
+##   ARCHIVE_DIR     - secondary/overflow storage (e.g. an external drive). Mounted as /archive
+##                     into radarr, sonarr, jellyfin as a second root folder. Being a different
+##                     physical disk, moves here are always a real copy, never a hardlink.
+## Example: MEDIA_DATA_DIR=/Users/you/Movies/media-stack ARCHIVE_DIR=/Volumes/Archive/media-stack-archive docker compose ...
 services:
 
   # To use/enable VPN, Run this compose file with --profile=vpn. Its highly recommended to use VPN.
@@ -45,14 +56,13 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
       
-    # Uncomment/enable below ports if VPN is used/enabled
-    # ports:
-    #   # qbittorrent ports
-    #   - 5080:5080
-    #   - 6881:6881
-    #   - 6881:6881/udp
-    #   # prowlarr ports
-    #   - 9696:9696
+    ports:
+      # qbittorrent ports
+      - 5080:5080
+      - 6881:6881
+      - 6881:6881/udp
+      # prowlarr ports
+      - 9696:9696
     volumes:
       - gluetun-data:/gluetun
     restart: "unless-stopped"
@@ -64,17 +74,15 @@ services:
     container_name: qbittorrent
     image: lscr.io/linuxserver/qbittorrent:5.2.2
 
-    # Unomment below if vpn is enabled
-    # depends_on:               # Uncomment this line if vpn is enabled
-      # vpn:                   # Uncomment this line if vpn is enabled
-      #   condition: service_healthy # Uncomment this line if vpn is enabled
+    depends_on:
+      vpn:
+        condition: service_healthy
 
     # Comment below lines if VPN is enabled
-    networks:               # Comment this line if vpn is enabled
-      - mynetwork           # Comment this line if vpn is enabled
+    # networks:               # Comment this line if vpn is enabled
+      # - mynetwork           # Comment this line if vpn is enabled
 
-    # Unomment below line if vpn is enabled
-    # network_mode: service:vpn
+    network_mode: service:vpn
 
     environment:
       - PUID=1000
@@ -83,24 +91,25 @@ services:
       - WEBUI_PORT=5080
     volumes:
       - qbittorrent-config:/config
-      - torrent-downloads:/downloads
+      - ${MEDIA_DATA_DIR}:/data
 
     ## Comment/Disable below ports if VPN is enabled
-    ports:
-      - 5080:5080
-      - 6881:6881
-      - 6881:6881/udp
+    # ports:
+    #   - 5080:5080
+    #   - 6881:6881
+    #   - 6881:6881/udp
     restart: "unless-stopped"
 
   radarr:
     profiles: ["vpn", "no-vpn"]
     container_name: radarr
     image: lscr.io/linuxserver/radarr:6.2.1
-    networks:
-      - mynetwork   # Comment this line if VPN is enabled
+    # networks:
+      # - mynetwork   # Comment this line if VPN is enabled
     ## Uncomment below lines if VPN is enabled
-    #   mynetwork:
-    #     ipv4_address: ${RADARR_STATIC_CONTAINER_IP} # It should be available IPv4 address in range of docker network `mynetwork` e.g. 172.20.0.2
+    networks:
+      mynetwork:
+        ipv4_address: ${RADARR_STATIC_CONTAINER_IP} # It should be available IPv4 address in range of docker network `mynetwork` e.g. 172.20.0.2
     environment:
       - PUID=1000
       - PGID=1000
@@ -109,25 +118,28 @@ services:
       - 7878:7878
     volumes:
       - radarr-config:/config
-      - torrent-downloads:/downloads
+      - ${MEDIA_DATA_DIR}:/data
+      - ${ARCHIVE_DIR}:/archive
     restart: "unless-stopped"
 
   sonarr:
     profiles: ["vpn", "no-vpn"]
     image: linuxserver/sonarr:4.0.17
     container_name: sonarr
-    networks:
-      - mynetwork   # Comment this line if VPN is enabled
+    # networks:
+      # - mynetwork   # Comment this line if VPN is enabled
     ## Uncomment below lines if VPN is enabled
-    #   mynetwork:
-    #     ipv4_address: ${SONARR_STATIC_CONTAINER_IP} # It should be available IPv4 address in range of docker network `mynetwork` e.g. 172.20.0.2
+    networks:
+      mynetwork:
+        ipv4_address: ${SONARR_STATIC_CONTAINER_IP} # It should be available IPv4 address in range of docker network `mynetwork` e.g. 172.20.0.2
     environment:
       - PUID=1000
       - PGID=1000
       - TZ=UTC
     volumes:
       - sonarr-config:/config
-      - torrent-downloads:/downloads
+      - ${MEDIA_DATA_DIR}:/data
+      - ${ARCHIVE_DIR}:/archive
     ports:
       - 8989:8989
     restart: unless-stopped
@@ -137,14 +149,13 @@ services:
     container_name: prowlarr
     image: linuxserver/prowlarr:2.4.0
 
-    # Uncomment below if vpn is enabled
-    # depends_on:               # Uncomment this line if vpn is enabled
-      # vpn:                   # Uncomment this line if vpn is enabled
-      #   condition: service_healthy # Uncomment this line if vpn is enabled
-    # network_mode: service:vpn # Uncomment this line if vpn is enabled
+    depends_on:
+      vpn:
+        condition: service_healthy
+    network_mode: service:vpn
 
-    networks:               # Comment this line if vpn is enabled
-      - mynetwork           # Comment this line if vpn is enabled
+    # networks:               # Comment this line if vpn is enabled
+      # - mynetwork           # Comment this line if vpn is enabled
     environment:
       - PUID=1000
       - PGID=1000
@@ -153,8 +164,8 @@ services:
       - prowlarr-config:/config
 
     # Comment below ports if VPN is enabled.
-    ports:
-      - 9696:9696
+    # ports:
+    #   - 9696:9696
     restart: unless-stopped
 
   recommendarr:
@@ -203,7 +214,8 @@ services:
       - TZ=UTC
     volumes:
       - jellyfin-config:/config
-      - torrent-downloads:/data
+      - ${MEDIA_DATA_DIR}:/data
+      - ${ARCHIVE_DIR}:/archive
   # devices:
    #  - /dev/videoN:/dev/videoN # Mount GPU device 
     ports:
@@ -246,7 +258,6 @@ services:
 
 volumes:
   gluetun-data:
-  torrent-downloads:
   radarr-config:
   sonarr-config:
   prowlarr-config:

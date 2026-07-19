@@ -53,6 +53,28 @@ docker network create --subnet 172.20.0.0/16 mynetwork
 # Update the CIDR range based on your available IP range
 ```
 
+## Configure Storage (Primary + Archive)
+
+This stack expects two host paths, passed as environment variables (same pattern as the VPN variables below, no in-file defaults since they're host-specific):
+
+- `MEDIA_DATA_DIR` - primary storage on your fastest disk (e.g. an internal SSD). It's mounted as a **single** bind mount at `/data` into qBittorrent, Radarr, Sonarr, and Jellyfin, containing:
+  - `/data/torrents/movies`, `/data/torrents/tvshows` - qBittorrent's download location
+  - `/data/media/movies`, `/data/media/tvshows` - the Radarr/Sonarr library (import destination)
+
+  Keeping downloads and library **under one mounted directory** is required for instant imports: Radarr/Sonarr's "Use Hardlinks instead of Copy" only works when the source and destination are on the same filesystem. If you mount them as two separate bind mounts instead, Docker Desktop can present them as different filesystems even if they're on the same physical disk, silently turning your "instant" imports into slow copies.
+
+- `ARCHIVE_DIR` - secondary/overflow storage (e.g. an external drive), mounted as `/archive` into Radarr, Sonarr, and Jellyfin. Being a separate physical disk, anything moved here is always a real copy, never a hardlink - use it as a manual second root folder for older/overflow titles you move off the SSD yourself.
+
+Create the folders and export the variables before running any `docker compose` command below, e.g.:
+
+```bash
+mkdir -p "$MEDIA_DATA_DIR"/torrents/movies "$MEDIA_DATA_DIR"/torrents/tvshows
+mkdir -p "$MEDIA_DATA_DIR"/media/movies "$MEDIA_DATA_DIR"/media/tvshows
+mkdir -p "$ARCHIVE_DIR"/movies "$ARCHIVE_DIR"/tvshows
+```
+
+🚨 If `ARCHIVE_DIR` points at an external/removable drive, make sure the drive is actually mounted first. If the mount path doesn't exist when Docker starts, Docker will silently create an empty folder there on your primary disk instead - and your "archive" will actually be writing to internal storage.
+
 When VPN is enabled, **qBittorrent** and **Prowlarr** will run behind the VPN for added privacy.  
 
 By default, **NordVPN** is used in `docker-compose.yml`, but you can switch to:
@@ -83,7 +105,7 @@ Once updated, follow the steps below to deploy the stack with VPN.
 ### Deploying the Stack with VPN (NordVPN Example)  
 
 ```bash
-VPN_SERVICE_PROVIDER=nordvpn OPENVPN_USER=openvpn-username OPENVPN_PASSWORD=openvpn-password SERVER_COUNTRIES=Switzerland RADARR_STATIC_CONTAINER_IP=radarr-container-static-ip SONARR_STATIC_CONTAINER_IP=sonarr-container-static-ip docker compose --profile vpn up -d
+VPN_SERVICE_PROVIDER=nordvpn OPENVPN_USER=openvpn-username OPENVPN_PASSWORD=openvpn-password SERVER_COUNTRIES=Switzerland RADARR_STATIC_CONTAINER_IP=radarr-container-static-ip SONARR_STATIC_CONTAINER_IP=sonarr-container-static-ip MEDIA_DATA_DIR=/path/to/ssd/media-stack ARCHIVE_DIR=/path/to/archive/media-stack-archive docker compose --profile vpn up -d
 
 # OPTIONAL: Use Nginx as a reverse proxy
 # docker compose -f docker-compose-nginx.yml up -d
@@ -107,7 +129,7 @@ Use the following environment variables to set static IPs:
 To proceed without VPN, run the following command:  
 
 ```bash
-docker compose --profile no-vpn up -d
+MEDIA_DATA_DIR=/path/to/ssd/media-stack ARCHIVE_DIR=/path/to/archive/media-stack-archive docker compose --profile no-vpn up -d
 
 # OPTIONAL: Use Nginx as a reverse proxy
 # docker compose -f docker-compose-nginx.yml up -d
@@ -142,24 +164,28 @@ COMPOSE_PROFILES=vpn,recommendarr docker compose up -d  # With VPN
 docker exec -it qbittorrent bash # Get inside qBittorrent container
 
 # Above command will get you inside qBittorrent interactive terminal, Run below command in qbt terminal
-mkdir /downloads/movies /downloads/tvshows
-chown 1000:1000 /downloads/movies /downloads/tvshows
+mkdir /data/torrents/movies /data/torrents/tvshows
+chown 1000:1000 /data/torrents/movies /data/torrents/tvshows
 ```
+
+- Options --> Downloads --> Default Save Path --> `/data/torrents` (or set separate per-category save paths for `/data/torrents/movies` and `/data/torrents/tvshows` under Options --> Downloads --> Categories)
 
 ## Configure Radarr
 
 - Open Radarr at http://localhost:7878
 - Settings --> Media Management --> Check mark "Movies deleted from disk are automatically unmonitored in Radarr" under File management section --> Save
-- Settings --> Media Management --> Scroll to bottom --> Add Root Folder --> Browse to /downloads/movies --> OK
+- Settings --> Media Management --> File Management --> Check mark "Use Hardlinks instead of Copy" --> Save. This is what makes imports from `/data/torrents/movies` into the library instant instead of a real file copy, since both live under the same `/data` mount.
+- Settings --> Media Management --> Scroll to bottom --> Add Root Folder --> Browse to `/data/media/movies` --> OK. This is your primary (SSD) root folder.
+- Optional archive tier: Settings --> Media Management --> Add Root Folder --> Browse to `/archive/movies` --> OK. When you want to move an older movie off the SSD, use Radarr's "Edit Movie" screen --> Root Folder --> switch it to `/archive/movies` and let it move the files (this will be a real copy+delete, not a hardlink, since it's a different disk).
 - Settings --> Download clients --> qBittorrent --> Add Host (qbittorrent) and port (5080) --> Username and password --> Test --> Save **Note: If VPN is enabled, then qbittorrent is reachable on vpn's service name. In this case use `vpn` in Host field.**
 - Settings --> General --> Enable advance setting --> Select Authentication and add username and password
 - Indexer will get automatically added during configuration of Prowlarr. See 'Configure Prowlarr' section.
 
-Sonarr can also be configured in similar way.
+Sonarr can be configured the same way, using `/data/media/tvshows` as its primary root folder and `/archive/tvshows` as its archive root folder.
 
 **Add a movie** (After Prowlarr is configured)
 
-- Movies --> Search for a movie --> Add Root folder (/downloads/movies) --> Quality profile --> Add movie
+- Movies --> Search for a movie --> Add Root folder (`/data/media/movies`) --> Quality profile --> Add movie
 - All queued movies download can be checked here, Activities --> Queue 
 - Go to qBittorrent (http://localhost:5080) and see if movie is getting downloaded (After movie is queued. This depends on availability of movie in indexers configured in Prowlarr.)
 
@@ -167,7 +193,8 @@ Sonarr can also be configured in similar way.
 
 - Open Jellyfin at http://localhost:8096
 - When you access the jellyfin for first time using browser, A guided configuration will guide you to configure jellyfin. Just follow the guide.
-- Add media library folder and choose /data/movies/
+- Add a media library folder and choose `/data/media/movies` (and another for `/data/media/tvshows`)
+- Optionally add a second library pointed at `/archive/movies` / `/archive/tvshows` so archived titles still show up in Jellyfin even though they've been moved off the SSD.
 
 ## Configure Seerr
 
