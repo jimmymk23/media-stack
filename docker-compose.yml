@@ -73,7 +73,7 @@ services:
     # networks:               # Comment this line if vpn is enabled
     #   - mynetwork           # Comment this line if vpn is enabled
 
-    # Unomment below line if vpn is enabled
+    # Uncomment below line if vpn is enabled
     network_mode: service:vpn
 
     environment:
@@ -81,16 +81,17 @@ services:
       - PGID=1000
       - TZ=UTC
       - WEBUI_PORT=5080
+      - UMASK=002
     volumes:
       - qbittorrent-config:/config
-      - torrent-downloads:/downloads
+      - ${DATA_ROOT:-/Volumes/MediaServer/data}/torrents:/data/torrents
 
     ## Comment/Disable below ports if VPN is enabled
     # ports:
     #   - 5080:5080
     #   - 6881:6881
     #   - 6881:6881/udp
-    # restart: "unless-stopped"
+    restart: "unless-stopped"
 
   radarr:
     profiles: ["vpn", "no-vpn"]
@@ -105,11 +106,12 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=UTC
+      - UMASK=002
     ports:
       - 7878:7878
     volumes:
       - radarr-config:/config
-      - torrent-downloads:/downloads
+      - ${DATA_ROOT:-/Volumes/MediaServer/data}:/data
     restart: "unless-stopped"
 
   sonarr:
@@ -125,9 +127,10 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=UTC
+      - UMASK=002
     volumes:
       - sonarr-config:/config
-      - torrent-downloads:/downloads
+      - ${DATA_ROOT:-/Volumes/MediaServer/data}:/data
     ports:
       - 8989:8989
     restart: unless-stopped
@@ -201,9 +204,10 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=UTC
+      - UMASK=002
     volumes:
       - jellyfin-config:/config
-      - torrent-downloads:/data
+      - ${DATA_ROOT:-/Volumes/MediaServer/data}/media:/data/media
   # devices:
    #  - /dev/videoN:/dev/videoN # Mount GPU device 
     ports:
@@ -246,7 +250,6 @@ services:
 
 volumes:
   gluetun-data:
-  torrent-downloads:
   radarr-config:
   sonarr-config:
   prowlarr-config:
