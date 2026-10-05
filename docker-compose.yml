@@ -12,12 +12,24 @@ services:
       - NET_ADMIN
     environment:
       - VPN_SERVICE_PROVIDER=${VPN_SERVICE_PROVIDER:-nordvpn} # Valid values: nordvpn, expressvpn, protonvpn, surfshark or custom
-      - OPENVPN_USER=${OPENVPN_USER:-""}
-      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-""}
+      ## Switch protocol by changing VPN_TYPE in .env (openvpn or wireguard), then: docker compose --profile vpn up -d
+      - VPN_TYPE=${VPN_TYPE:-openvpn}
+      - OPENVPN_USER=${OPENVPN_USER:-}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD:-}
+      ## WireGuard (ProtonVPN: private key from a WireGuard config generated at account.protonvpn.com -> Downloads -> WireGuard)
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY:-}
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES:-}  # Optional for protonvpn; the "Address" from the config if set
+
+      ## ProtonVPN port forwarding (NAT-PMP). For OpenVPN, OPENVPN_USER must end with "+pmp". Only P2P servers support it.
+      - VPN_PORT_FORWARDING=${VPN_PORT_FORWARDING:-off}
+      - PORT_FORWARD_ONLY=${VPN_PORT_FORWARDING:-off}
+      ## Pushes the forwarded port into qBittorrent (needs "Bypass authentication for clients on localhost" enabled in qBittorrent WebUI options)
+      - VPN_PORT_FORWARDING_UP_COMMAND=/bin/sh -c 'wget -O- --retry-connrefused --post-data "json={\"listen_port\":{{PORTS}}}" http://127.0.0.1:5080/api/v2/app/setPreferences 2>&1'
 
       ## For list of server countries, visit https://raw.githubusercontent.com/qdm12/gluetun/master/internal/storage/servers.json
       ## When VPN_SERVICE_PROVIDER is custom. Comment the below line
       - SERVER_COUNTRIES=${SERVER_COUNTRIES:-Switzerland}
+      - SERVER_CITIES=${SERVER_CITIES:-}  # Optional, e.g. New York
     
       # - FREE_ONLY=on  # Valid with protonvpn only. Value willbe set "on" if using free subscription provided by protonvpn
 
