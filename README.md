@@ -6,7 +6,7 @@ A self-hosted media ecosystem that combines media management, streaming, AI-powe
 
 This stack includes:
 
-- **VPN:** For secure and private media downloading
+- **VPN:** ([Gluetun](https://github.com/qdm12/gluetun)) For secure and private media downloading
 - **Radarr:** For movie management
 - **Sonarr:** For TV show management
 - **Prowlarr:** A torrent indexer manager for Radarr/Sonarr
@@ -21,6 +21,20 @@ This stack includes:
 - Docker compose version v2.33.1 or later
 - Older versions may work, but they have not been tested.
 
+## How it fits together
+
+```
+Seerr ──► Radarr / Sonarr ──► Prowlarr ──► torrent indexers   (via VPN)
+               │
+               └──► qBittorrent ──► torrent peers              (via VPN)
+               │
+               └──► hardlinks finished files into media/ ──► Jellyfin
+```
+
+- **qBittorrent** and **Prowlarr** share the VPN container's network. All their traffic leaves through the VPN tunnel, and if the tunnel drops they lose internet access instead of falling back to your real IP.
+- **Radarr, Sonarr, Seerr and Jellyfin** are *not* behind the VPN. They only talk to metadata services and to each other.
+- Because of this, other containers reach qBittorrent at `vpn:5080` and Prowlarr at `vpn:9696` (not `qbittorrent` / `prowlarr`).
+
 ## Install media stack
 
 > **⚠️ Important Notice for Jellyseerr/Seerr Users:**
@@ -34,77 +48,184 @@ This stack includes:
 
 There are three ways to deploy this stack:
 
-1. **With a VPN** (Recommended)  
-2. **Without a VPN**  
-3. **With Recommendarr** (An optional tool for AI-generated movie and show recommendations)  
+1. **With a VPN** (Recommended, and the default configuration in `docker-compose.yml`)
+2. **Without a VPN**
+3. **With Recommendarr** (An optional tool for AI-generated movie and show recommendations)
 
-> **NOTE:** If you are installing this stack **without a VPN**, you **must** use the `no-vpn` profile.  
-> This requirement prevents accidental or unintentional deployment of media-stack without VPN.  
->  
-> Running the `docker compose` command without a profile **will not deploy anything**.  
->  
-> Check the installation steps below. 
+> **NOTE:** Every service is assigned to a profile (`vpn`, `no-vpn` or `recommendarr`).
+> Running the `docker compose` command without a profile **will not deploy anything**.
+> This prevents accidental or unintentional deployment of media-stack without VPN.
 
+### 1. Create the Docker network
 
-Before deploying the stack, you must first create a Docker network:  
+Before deploying the stack, you must first create a Docker network:
 
 ```bash
 docker network create --subnet 172.20.0.0/16 mynetwork
 # Update the CIDR range based on your available IP range
 ```
 
-When VPN is enabled, **qBittorrent** and **Prowlarr** will run behind the VPN for added privacy.  
+### 2. Prepare the storage folder
 
-By default, **NordVPN** is used in `docker-compose.yml`, but you can switch to:
+All media and downloads live under a single host folder, set with the `DATA_ROOT` variable
+(default: `/Volumes/MediaServer/data`, an external drive). Create this layout:
 
-- **ExpressVPN**  
-- **SurfShark**  
-- **ProtonVPN**  
-- **Custom OpenVPN**  
+```bash
+mkdir -p "$DATA_ROOT"/{torrents,media}/{movies,tv}
+```
+
+```
+$DATA_ROOT/
+├── torrents/            # qBittorrent downloads   → /data/torrents in containers
+│   ├── movies/
+│   └── tv/
+└── media/               # Final library           → /data/media in containers
+    ├── movies/
+    └── tv/
+```
+
+How the folders are mounted:
+
+| Container | Host path | Container path |
+|---|---|---|
+| qBittorrent | `$DATA_ROOT/torrents` | `/data/torrents` |
+| Radarr, Sonarr | `$DATA_ROOT` | `/data` |
+| Jellyfin | `$DATA_ROOT/media` | `/data/media` |
+
+Radarr and Sonarr see both `torrents/` and `media/` under the same `/data` mount. This lets them
+**hardlink** finished downloads into the library instead of copying them, so a file isn't stored
+twice and qBittorrent can keep seeding it. Don't split these into separate mounts.
+
+> **NOTE (macOS / external drive):**
+> - Docker Desktop must be allowed to access the drive: Settings → Resources → File sharing.
+> - The drive must be **mounted before the containers are created**. If it isn't, Docker fails with
+>   `mkdir /host_mnt/Volumes/...: permission denied`.
+> - A container keeps the mount path it was created with. After changing `DATA_ROOT`, re-run
+>   `docker compose --profile vpn up -d` so the containers are recreated, then confirm with
+>   `docker inspect radarr --format '{{range .Mounts}}{{.Source}} {{end}}'`.
+>   Otherwise, downloads can silently end up on the wrong disk.
+
+### 3. Create the `.env` file
+
+Settings are read from a `.env` file next to `docker-compose.yml`, which Compose loads automatically.
+Add `.env` to `.gitignore`, since it holds your VPN credentials.
+
+```env
+# Host folder holding torrents/ and media/ (mounted at /data in the containers)
+DATA_ROOT=/Volumes/MediaServer/data
+
+# VPN (gluetun)
+VPN_SERVICE_PROVIDER=protonvpn   # nordvpn, expressvpn, protonvpn, surfshark or custom
+VPN_TYPE=openvpn                 # openvpn or wireguard
+SERVER_COUNTRIES=Switzerland
+# SERVER_CITIES=                 # Optional
+
+# If VPN_TYPE=openvpn
+OPENVPN_USER=
+OPENVPN_PASSWORD=
+
+# If VPN_TYPE=wireguard
+# WIREGUARD_PRIVATE_KEY=
+# WIREGUARD_ADDRESSES=           # Optional for protonvpn
+
+# Static IPs on the "mynetwork" network (see "Static Container IP Requirement")
+RADARR_STATIC_CONTAINER_IP=172.20.0.100
+SONARR_STATIC_CONTAINER_IP=172.20.0.101
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATA_ROOT` | `/Volumes/MediaServer/data` | Host folder for downloads and media |
+| `VPN_SERVICE_PROVIDER` | `nordvpn` | VPN provider (nordvpn, expressvpn, protonvpn, surfshark, custom) |
+| `VPN_TYPE` | `openvpn` | `openvpn` or `wireguard` |
+| `OPENVPN_USER` / `OPENVPN_PASSWORD` | empty | OpenVPN credentials (OpenVPN only) |
+| `WIREGUARD_PRIVATE_KEY` / `WIREGUARD_ADDRESSES` | empty | WireGuard settings (WireGuard only) |
+| `SERVER_COUNTRIES` / `SERVER_CITIES` | `Switzerland` / empty | Where to connect |
+| `VPN_PORT_FORWARDING` | `off` | ProtonVPN port forwarding, see below |
+| `RADARR_STATIC_CONTAINER_IP` / `SONARR_STATIC_CONTAINER_IP` | none (required) | Static IPs, see below |
+
+Check what Compose resolves with `docker compose --profile vpn config`.
+
+### 4. Configure your VPN provider
+
+By default, **NordVPN** is the provider if `VPN_SERVICE_PROVIDER` isn't set, but you can switch to:
+
+- **ExpressVPN**
+- **SurfShark**
+- **ProtonVPN**
+- **Custom OpenVPN**
 - **WireGuard VPN**
-
-All providers use the **OpenVPN** protocol.
 
 ➡️ **Full list of supported VPN providers:** [VPN Providers](https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers)
 
-### Configure Your VPN Provider  
+Switch between OpenVPN and WireGuard by changing `VPN_TYPE` in `.env`, then run
+`docker compose --profile vpn up -d` again.
 
-Refer to your VPN provider's documentation to generate an **OpenVPN username and password**.  
-For setup instructions, check:  
-➡️ [Gluetun VPN Setup Guide](https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers)
+**OpenVPN:** Refer to your VPN provider's documentation to generate an **OpenVPN username and password**.
+These are usually different from your normal account login. For ProtonVPN, find them at
+account.protonvpn.com → Account → OpenVPN / IKEv2 username. See the
+[Gluetun VPN Setup Guide](https://github.com/qdm12/gluetun-wiki/tree/main/setup/providers).
 
-### Enabling VPN in `docker-compose.yml`  
+**WireGuard (ProtonVPN example):** Generate a WireGuard config at account.protonvpn.com → Downloads → WireGuard,
+and put its private key in `WIREGUARD_PRIVATE_KEY`. Set `WIREGUARD_ADDRESSES` to the config's `Address`
+only if your provider needs it.
 
-By default, **VPN is disabled** in `docker-compose.yml`. To enable it, simply **comment/uncomment** the required lines in the file.  
-The `docker-compose.yml` file includes clear instructions in the comments to guide you through the process.  
+**ProtonVPN free plan:** Uncomment `- FREE_ONLY=on` in the `vpn` service of `docker-compose.yml`, and set
+`SERVER_COUNTRIES` to a country the free plan offers.
 
-Once updated, follow the steps below to deploy the stack with VPN.  
+**ProtonVPN port forwarding (optional):** Set `VPN_PORT_FORWARDING=on` in `.env`. For OpenVPN, your
+`OPENVPN_USER` must end in `+pmp`, and only P2P servers support it. Gluetun pushes the forwarded port into
+qBittorrent automatically, which requires **Options → WebUI → "Bypass authentication for clients on localhost"**
+to be enabled in qBittorrent.
 
-### Deploying the Stack with VPN (NordVPN Example)  
+### Static Container IP Requirement
+
+A **static container IP address** is needed when **Prowlarr** is behind a VPN.
+Since Prowlarr can only communicate with **Radarr** and **Sonarr** using their **container IP addresses**,
+these must be **manually assigned** to avoid connection issues when containers restart.
+
+Use `RADARR_STATIC_CONTAINER_IP` and `SONARR_STATIC_CONTAINER_IP` in `.env`, with free addresses inside the
+`mynetwork` subnet. **Pick addresses high in the range** (for example `.100` and `.101`):
+Docker assigns low addresses to other containers first, and a clash leaves Radarr or Sonarr stuck in the
+`Created` state with `Address already in use`.
+Check what's in use with `docker network inspect mynetwork`.
+
+### 5. Deploy the stack with VPN
 
 ```bash
-VPN_SERVICE_PROVIDER=nordvpn OPENVPN_USER=openvpn-username OPENVPN_PASSWORD=openvpn-password SERVER_COUNTRIES=Switzerland RADARR_STATIC_CONTAINER_IP=radarr-container-static-ip SONARR_STATIC_CONTAINER_IP=sonarr-container-static-ip docker compose --profile vpn up -d
+docker compose --profile vpn up -d
 
 # OPTIONAL: Use Nginx as a reverse proxy
 # docker compose -f docker-compose-nginx.yml up -d
-```  
+```
 
-### Static Container IP Requirement  
+You can also pass the same settings inline instead of using `.env`, for example:
+`VPN_SERVICE_PROVIDER=nordvpn OPENVPN_USER=... OPENVPN_PASSWORD=... RADARR_STATIC_CONTAINER_IP=... SONARR_STATIC_CONTAINER_IP=... docker compose --profile vpn up -d`
 
-A **static container IP address** is needed when **Prowlarr** is behind a VPN.  
-Since Prowlarr can only communicate with **Radarr** and **Sonarr** using their **container IP addresses**,  
-these must be **manually assigned** to avoid connection issues when containers restart.  
+### 6. Verify the VPN
 
-Use the following environment variables to set static IPs:  
+`qbittorrent` and `prowlarr` should show the VPN's IP address, never your own:
 
-- `RADARR_STATIC_CONTAINER_IP`  
-- `SONARR_STATIC_CONTAINER_IP`  
+```bash
+docker logs vpn                                          # should show a connection and a public IP
+docker exec qbittorrent curl -s https://ipinfo.io/ip     # VPN IP
+docker exec prowlarr curl -s https://ipinfo.io/ip        # VPN IP
+curl -s https://ipinfo.io/ip                             # your real IP, for comparison
+docker inspect qbittorrent --format '{{.HostConfig.NetworkMode}}'   # container:<id>, not mynetwork
+```
 
-## Deploy the Stack Without VPN  
+## Deploy the Stack Without VPN
 
-🚨 **Warning:** Deploying without a VPN is **highly discouraged** as it may expose your IP address when torrenting media.  
+🚨 **Warning:** Deploying without a VPN is **highly discouraged** as it may expose your IP address when torrenting media.
 
-To proceed without VPN, run the following command:  
+The VPN is on by default in `docker-compose.yml`. To run without it, you must edit the file. Inline comments
+mark each line to flip:
+
+- `qbittorrent`: comment out `depends_on` and `network_mode: service:vpn`, uncomment its `networks` and `ports`
+- `prowlarr`: comment out `depends_on` and `network_mode: service:vpn`, uncomment its `networks` and `ports`
+- `radarr` / `sonarr`: swap the static-IP `networks` block for the plain `- mynetwork` entry
+
+Then run:
 
 ```bash
 docker compose --profile no-vpn up -d
@@ -113,18 +234,18 @@ docker compose --profile no-vpn up -d
 # docker compose -f docker-compose-nginx.yml up -d
 ```
 
-## Deploy the Stack with Recommendarr (Optional)  
+## Deploy the Stack with Recommendarr (Optional)
 
-**Recommendarr** is a web application that uses AI to generate personalized TV show and movie recommendations based on your: 
+**Recommendarr** is a web application that uses AI to generate personalized TV show and movie recommendations based on your:
 
-- **Sonarr** library  
-- **Radarr** library 
+- **Sonarr** library
+- **Radarr** library
 - **Jellyfin** watchlist and library
 - **Trakt** watchlist (Optional)
 
-### Deploying with Recommendarr  
+### Deploying with Recommendarr
 
-Run the following command based on your setup:  
+Run the following command based on your setup:
 
 ```bash
 COMPOSE_PROFILES=vpn,recommendarr docker compose up -d  # With VPN
@@ -132,59 +253,87 @@ COMPOSE_PROFILES=vpn,recommendarr docker compose up -d  # With VPN
 # COMPOSE_PROFILES=no-vpn,recommendarr docker compose up -d  # Without VPN
 ```
 
+## Setup order
+
+Configure the apps in this order, since each step uses what the previous one set up:
+**qBittorrent → Radarr → Sonarr → Prowlarr → Jellyfin → Seerr**.
+
+| App | URL |
+|---|---|
+| qBittorrent | http://localhost:5080 |
+| Prowlarr | http://localhost:9696 |
+| Radarr | http://localhost:7878 |
+| Sonarr | http://localhost:8989 |
+| Jellyfin | http://localhost:8096 |
+| Seerr | http://localhost:5055 |
+
 ## Configure qBittorrent
 
 - Open qBitTorrent at http://localhost:5080. Default username is `admin`. Temporary password can be collected from container log `docker logs qbittorrent`
 - Go to Tools --> Options --> WebUI --> Change password
-- Run below commands on the server
-
-```bash
-docker exec -it qbittorrent bash # Get inside qBittorrent container
-
-# Above command will get you inside qBittorrent interactive terminal, Run below command in qbt terminal
-mkdir /downloads/movies /downloads/tvshows
-chown 1000:1000 /downloads/movies /downloads/tvshows
-```
+- Go to Tools --> Options --> Downloads:
+  - Default Save Path: `/data/torrents`
+  - Default Torrent Management Mode: **Automatic**
+- No folder creation is needed: the `torrents/movies` and `torrents/tv` folders come from your `DATA_ROOT` layout (see "Prepare the storage folder"). Radarr and Sonarr create the `movies` and `tv` categories automatically when they send a download.
 
 ## Configure Radarr
 
 - Open Radarr at http://localhost:7878
 - Settings --> Media Management --> Check mark "Movies deleted from disk are automatically unmonitored in Radarr" under File management section --> Save
-- Settings --> Media Management --> Scroll to bottom --> Add Root Folder --> Browse to /downloads/movies --> OK
-- Settings --> Download clients --> qBittorrent --> Add Host (qbittorrent) and port (5080) --> Username and password --> Test --> Save **Note: If VPN is enabled, then qbittorrent is reachable on vpn's service name. In this case use `vpn` in Host field.**
+- Settings --> Media Management --> Scroll to bottom --> Add Root Folder --> Browse to `/data/media/movies` --> OK
+- Settings --> Download clients --> qBittorrent --> Add Host (`vpn`) and port (5080) --> Username and password --> Category (`movies`) --> Test --> Save **Note: With the VPN enabled, qBittorrent is reachable on the VPN's service name, so use `vpn` in the Host field. Without the VPN, use `qbittorrent`.**
 - Settings --> General --> Enable advance setting --> Select Authentication and add username and password
+- Copy the API key from Settings --> General. Prowlarr needs it.
 - Indexer will get automatically added during configuration of Prowlarr. See 'Configure Prowlarr' section.
 
-Sonarr can also be configured in similar way.
+Configure Sonarr in a similar way, with these differences:
+
+- Root folder: `/data/media/tv`
+- Download client category: `tv`
+- Static IP / port for Prowlarr: `SONARR_STATIC_CONTAINER_IP`, port `8989`
 
 **Add a movie** (After Prowlarr is configured)
 
-- Movies --> Search for a movie --> Add Root folder (/downloads/movies) --> Quality profile --> Add movie
-- All queued movies download can be checked here, Activities --> Queue 
+- Movies --> Search for a movie --> Add Root folder (`/data/media/movies`) --> Quality profile --> Add movie
+- Choose the quality profile carefully: a 2160p remux can be 50 GB or more.
+- All queued movies download can be checked here, Activities --> Queue
 - Go to qBittorrent (http://localhost:5080) and see if movie is getting downloaded (After movie is queued. This depends on availability of movie in indexers configured in Prowlarr.)
-
-## Configure Jellyfin
-
-- Open Jellyfin at http://localhost:8096
-- When you access the jellyfin for first time using browser, A guided configuration will guide you to configure jellyfin. Just follow the guide.
-- Add media library folder and choose /data/movies/
-
-## Configure Seerr
-
-- Open Jellyfin at http://localhost:5055
-- When you access the seerr for first time using browser, A guided configuration will guide you to configure seerr. Just follow the guide and provide the required details about sonarr and Radarr.
-- Follow the Seerr document for detailed setup - https://docs.seerr.dev/
 
 ## Configure Prowlarr
 
 - Open Prowlarr at http://localhost:9696
 - Settings --> General --> Authentications --> Select Authentication and add username and password
 - Add Indexers, Indexers --> Add Indexer --> Search for indexer --> Choose base URL --> Test and Save
-- Add application, Settings --> Apps --> Add application --> Choose Radarr --> Prowlarr server (http://prowlarr:9696) --> Radarr server (http://radarr:7878) --> API Key --> Test and Save
-- Add application, Settings --> Apps --> Add application --> Choose Sonarr --> Prowlarr server (http://prowlarr:9696) --> Sonarr server (http://sonarr:8989) --> API Key --> Test and Save
+- Add application, Settings --> Apps --> Add application --> Choose Radarr --> Prowlarr server (`http://vpn:9696`) --> Radarr server (`http://<RADARR_STATIC_CONTAINER_IP>:7878`, e.g. `http://172.20.0.100:7878`) --> API Key --> Test and Save
+- Add application, Settings --> Apps --> Add application --> Choose Sonarr --> Prowlarr server (`http://vpn:9696`) --> Sonarr server (`http://<SONARR_STATIC_CONTAINER_IP>:8989`, e.g. `http://172.20.0.101:8989`) --> API Key --> Test and Save
 - This will add indexers in respective apps automatically.
 
-**Note: If VPN is enabled, then Prowlarr will not be able to reach radarr and sonarr with localhost or container service name. In that case use static IP for sonarr and radarr in radarr/sonarr server field (for e.g. http://172.19.0.5:8989). Prowlar will also be not reachable with its container/service name. Use `http://vpn:9696` instead in prowlar server field.**
+**Note: With the VPN enabled, Prowlarr cannot reach Radarr and Sonarr by `localhost` or container service name, so use their static IPs. Prowlarr is also not reachable by its own container name from other containers, so use `http://vpn:9696` as the Prowlarr server. (Without the VPN, use `http://prowlarr:9696`, `http://radarr:7878` and `http://sonarr:8989`.)**
+
+## Configure Jellyfin
+
+- Open Jellyfin at http://localhost:8096
+- When you access the jellyfin for first time using browser, A guided configuration will guide you to configure jellyfin. Follow the guide **through the last screen**. Seerr can't sign in until the wizard is finished.
+- Add media library folders: Movies --> `/data/media/movies`, Shows --> `/data/media/tv`
+
+## Configure Seerr
+
+- Open Seerr at http://localhost:5055
+- When you access the seerr for first time using browser, A guided configuration will guide you to configure seerr.
+- Choose **Jellyfin** as the media server. Hostname `jellyfin`, port `8096`, SSL off, and your Jellyfin username and password. Use `jellyfin`, not `localhost`: `localhost` inside the Seerr container means Seerr itself.
+- Sync libraries and enable Movies and Shows.
+- Add Radarr: hostname `radarr`, port `7878`, API key, then choose a quality profile and root folder `/data/media/movies`.
+- Add Sonarr: hostname `sonarr`, port `8989`, API key, root folder `/data/media/tv`, and enable Season Folders.
+- Follow the Seerr document for detailed setup - https://docs.seerr.dev/
+
+## Troubleshooting
+
+- **A container won't start with `permission denied` on `/host_mnt/Volumes/...`:** the external drive isn't mounted. Plug it in and re-run `docker compose --profile vpn up -d`.
+- **Radarr or Sonarr stuck in `Created` with `Address already in use`:** its static IP is taken. Pick a higher address in `.env`, see "Static Container IP Requirement".
+- **Downloads go to the wrong disk:** the containers were created with an old `DATA_ROOT`. Fix `.env` and re-run `docker compose --profile vpn up -d`.
+- **Seerr warns "The `/app/config` volume mount was not configured properly":** the image's marker file was copied into the volume. Your data is saved. Remove the warning with `docker exec seerr rm /app/config/DOCKER`.
+- **Radarr/Sonarr log `429 Too Many Requests` from an indexer:** the indexer is rate-limiting you. Radarr retries on the next search.
+- **Prowlarr or qBittorrent has no internet:** the VPN is down. Check `docker logs vpn`.
 
 ## Configure Recommendarr
 
