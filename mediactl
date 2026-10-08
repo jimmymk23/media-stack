@@ -436,33 +436,53 @@ qbit_delete() { # qbit_delete "hash1|hash2"
   echo "Removed torrent(s) and data from qBittorrent."
 }
 
-# hash_is_exclusive APP HASH IDS_JSON: true if no title outside IDS_JSON used this torrent.
-# Prints a skip notice and returns 1 otherwise.
+# hash_is_exclusive APP HASH IDS_JSON: true only if history confirms the torrent belongs
+# solely to titles in IDS_JSON. Fails closed (prints a skip notice, returns 1) otherwise.
 hash_is_exclusive() {
-  local other hist
-  if ! hist=$(arr_api "$1" GET "/history?downloadId=$2&pageSize=100"); then
-    echo "skipping $2: could not check whether other titles use it"; return 1
+  local upper hist verdict
+  upper=$(printf '%s' "$2" | tr 'a-z' 'A-Z')
+  if ! hist=$(arr_api "$1" GET "/history?downloadId=$upper&pageSize=1000"); then
+    echo "skipping $2: could not confirm it belongs only to archived titles"; return 1
   fi
-  if ! other=$(printf '%s' "$hist" | jq -r --argjson ids "$3" \
-    '(if type=="object" then .records else [] end)[] | (.movieId // .seriesId) | select(. != null) | select(. as $x | ($ids | index($x)) == null)' | head -n1); then
-    echo "skipping $2: could not check whether other titles use it"; return 1
-  fi
-  if [ -n "$other" ]; then
-    echo "skipping $2: also used by title id $other that is not being archived"
-    return 1
-  fi
-  return 0
+  verdict=$(printf '%s' "$hist" | jq -r --argjson ids "$3" '
+    if (type != "object") or ((.records | type) != "array") then "BAD"
+    else .records as $r
+      | (.totalRecords // ($r | length)) as $t
+      | ([$r[] | (.movieId // .seriesId)] | map(select(. != null))) as $o
+      | ([$o[] | select(. as $x | ($ids | index($x)) == null)]) as $other
+      | if $t > ($r | length) then "BAD"
+        elif ($other | length) > 0 then "OTHER:\($other[0])"
+        elif ($o | length) == 0 then "BAD"
+        else "OK" end
+    end' 2>/dev/null) || verdict=BAD
+  case "$verdict" in
+    OK) return 0 ;;
+    OTHER:*) echo "skipping $2: also used by title id ${verdict#OTHER:} that is not being archived"; return 1 ;;
+    *) echo "skipping $2: could not confirm it belongs only to archived titles"; return 1 ;;
+  esac
 }
 
-# wait_for_moves APP...: poll until no queued/started Move command remains. 1 on timeout.
+# wait_for_moves APP...: poll until no queued/started Move command remains.
+# Returns 0 idle, 1 timeout, 2 status unreadable (3 consecutive failed polls).
 wait_for_moves() {
-  local poll=${MEDIACTL_POLL_SECS:-5} timeout=${MEDIACTL_MOVE_TIMEOUT:-900} start=$SECONDS app busy
+  local poll=${MEDIACTL_POLL_SECS:-5} timeout=${MEDIACTL_MOVE_TIMEOUT:-900} start=$SECONDS
+  local app busy errs=0 failed n announced=0
   while true; do
-    busy=0
+    busy=0; failed=""
     for app in "$@"; do
-      if [ "$(arr_api "$app" GET /command | jq '[.[] | select((.status=="queued" or .status=="started") and (.name|test("Move")))] | length' 2>/dev/null || echo 0)" != 0 ]; then busy=1; fi
+      if ! n=$(arr_api "$app" GET /command 2>/dev/null | jq '[.[] | select((.status=="queued" or .status=="started") and (.name|test("Move")))] | length' 2>/dev/null) \
+         || [ -z "$n" ] || ! [ "$n" -ge 0 ] 2>/dev/null; then
+        failed=$app; busy=1
+      elif [ "$n" != 0 ]; then
+        busy=1
+      fi
     done
+    if [ -n "$failed" ]; then errs=$((errs + 1)); else errs=0; fi
+    if [ "$errs" -ge 3 ]; then
+      echo "could not read command status from $failed; torrents left in place"; return 2
+    fi
     if [ "$busy" -eq 0 ]; then return 0; fi
+    if [ "$announced" -eq 0 ]; then echo "Waiting for Radarr/Sonarr to finish moving files..."; announced=1; fi
     if [ $((SECONDS - start)) -ge "$timeout" ]; then return 1; fi
     sleep "$poll"
   done
@@ -540,13 +560,17 @@ cmd_move() {
   fi
   echo "Move requested; Radarr/Sonarr are moving the files (watch Activity in their UI)."
   if [ "$dir" = archive ] && { [ -s "$work/hashes_radarr" ] || [ -s "$work/hashes_sonarr" ]; }; then
-    local go=0
+    local go=0 wait_ok=0 wait_rc=0
     if [ "$rm_torrents" -eq 1 ] || ask_yes "Remove the matching torrent(s) and data from qBittorrent so SSD space is actually freed?"; then go=1; fi
     if [ "$go" -ne 1 ]; then
       echo "Torrent data left in place, so the SSD copy keeps using space. Re-run with --remove-torrents to free it."
-    elif ! wait_for_moves $moved; then
-      echo "Moves still running; torrents left in place. Re-run with --remove-torrents later."
+    elif wait_for_moves $moved; then
+      wait_ok=1
     else
+      wait_rc=$?
+      if [ "$wait_rc" -eq 1 ]; then echo "Moves still running; torrents left in place. Re-run with --remove-torrents later."; fi
+    fi
+    if [ "$wait_ok" -eq 1 ]; then
       local keep="" h
       for h in $(sort -u "$work/hashes_radarr"); do
         if hash_is_exclusive radarr "$h" "$rids"; then keep="$keep

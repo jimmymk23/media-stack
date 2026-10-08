@@ -42,6 +42,13 @@ while [ $i -lt ${#args[@]} ]; do
   i=$((i+1))
 done
 echo "$*" >> "$TMP/curl.log"
+# test hooks: FAIL_<key> always fails (exit 22); FAILN_<key> holds a count of failures left
+fk="$TMP/resp/FAIL_$(printf '%s' "$method $(printf '%s' "$url" | sed 's#^http://[^/]*##')" | tr -c 'A-Za-z0-9' '_')"
+if [ -f "$fk" ]; then exit 22; fi
+if [ -f "${fk/FAIL_/FAILN_}" ]; then
+  left=$(cat "${fk/FAIL_/FAILN_}")
+  if [ "$left" -gt 0 ]; then echo $((left-1)) > "${fk/FAIL_/FAILN_}"; exit 22; fi
+fi
 p=$(printf '%s' "$url" | sed 's#^http://[^/]*##')
 f="$TMP/resp/$(printf '%s' "$method $p" | tr -c 'A-Za-z0-9' '_')"
 if [ -f "$f" ]; then cat "$f"; else echo '[]'; fi

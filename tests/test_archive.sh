@@ -111,6 +111,7 @@ test_archive_remove_torrents_deletes_by_history_hash() {
   archive_ready; resp "GET /api/v3/movie" "$MOVIES"
   printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
   resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABCDEF"},{"downloadId":"ABCDEF"}]'
+  hist_for ABCDEF 1
   cmd_move archive "Heat (1995)" --yes --remove-torrents >/dev/null
   log=$(cat "$TMP/curl.log")
   assert_contains "$log" "hashes=abcdef"
@@ -120,6 +121,7 @@ test_archive_remove_torrents_deletes_by_history_hash() {
 test_archive_remove_torrents_without_qbit_credentials_explains() {
   archive_ready; resp "GET /api/v3/movie" "$MOVIES"
   resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABCDEF"}]'
+  hist_for ABCDEF 1
   out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
   assert_contains "$out" "QBIT_USER/QBIT_PASSWORD not set"
   assert_contains "$out" "abcdef"
@@ -129,6 +131,13 @@ test_archive_requires_archive_ready() {
   printf '/data ' > "$TMP/docker_inspect"
   if out=$( (cmd_move archive Heat --yes) 2>&1 ); then fail "should refuse"; fi
   assert_contains "$out" "mediactl up --archive"
+}
+
+# hist_for HASH_UPPER ID...: canned /history?downloadId reply like Radarr (uppercase downloadId)
+hist_for() {
+  local h=$1 recs="" id; shift
+  for id in "$@"; do recs="$recs${recs:+,}{\"movieId\":$id,\"downloadId\":\"$h\"}"; done
+  resp "GET /api/v3/history?downloadId=$h&pageSize=1000" "{\"totalRecords\":$#,\"records\":[$recs]}"
 }
 
 big_movies() { # 26 archivable titles
@@ -174,8 +183,8 @@ test_shared_hash_is_skipped_not_deleted() {
   printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
   export MEDIACTL_POLL_SECS=0
   resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"AAA"},{"downloadId":"BBB"}]'
-  resp "GET /api/v3/history?downloadId=aaa&pageSize=100" '{"records":[{"movieId":1},{"movieId":99}]}'
-  resp "GET /api/v3/history?downloadId=bbb&pageSize=100" '{"records":[{"movieId":1}]}'
+  hist_for AAA 1 99
+  hist_for BBB 1
   out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
   assert_contains "$out" "skipping aaa: also used by title id 99 that is not being archived"
   log=$(cat "$TMP/curl.log")
@@ -188,6 +197,7 @@ test_torrent_info_listed_before_delete_and_after_moves() {
   printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
   export MEDIACTL_POLL_SECS=0
   resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  hist_for ABC 1
   resp "GET /api/v2/torrents/info?hashes=abc" '[{"name":"Heat.1995.1080p","size":123456,"save_path":"/data/torrents/movies"}]'
   out=$(cmd_move archive "Heat (1995)" The\ Wire --yes --remove-torrents)
   assert_contains "$out" "Heat.1995.1080p  123456 bytes  /data/torrents/movies"
@@ -215,7 +225,76 @@ test_idle_command_queue_allows_delete() {
   printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
   export MEDIACTL_POLL_SECS=0 MEDIACTL_MOVE_TIMEOUT=0
   resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  hist_for ABC 1
   resp "GET /api/v3/command" '[{"name":"RefreshMovie","status":"started"},{"name":"MoveMovie","status":"completed"}]'
   cmd_move archive "Heat (1995)" --yes --remove-torrents >/dev/null
+  assert_contains "$(cat "$TMP/curl.log")" "torrents/delete"
+}
+
+test_empty_history_records_means_skipped_not_deleted() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
+  export MEDIACTL_POLL_SECS=0
+  resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  resp "GET /api/v3/history?downloadId=ABC&pageSize=1000" '{"totalRecords":0,"records":[]}'
+  out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
+  assert_contains "$out" "skipping abc: could not confirm it belongs only to archived titles"
+  assert_not_contains "$(cat "$TMP/curl.log")" "torrents/delete"
+}
+
+test_unrelated_only_history_is_skipped() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
+  export MEDIACTL_POLL_SECS=0
+  resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  hist_for ABC 55
+  out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
+  assert_contains "$out" "skipping abc: also used by title id 55"
+  assert_not_contains "$(cat "$TMP/curl.log")" "torrents/delete"
+}
+
+test_truncated_history_page_is_skipped() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
+  export MEDIACTL_POLL_SECS=0
+  resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  resp "GET /api/v3/history?downloadId=ABC&pageSize=1000" '{"totalRecords":5,"records":[{"movieId":1,"downloadId":"ABC"}]}'
+  out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
+  assert_contains "$out" "could not confirm"
+  assert_not_contains "$(cat "$TMP/curl.log")" "torrents/delete"
+}
+
+test_failed_history_lookup_is_skipped() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
+  export MEDIACTL_POLL_SECS=0
+  resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  : > "$TMP/resp/FAIL_GET__api_v3_history_downloadId_ABC_pageSize_1000"
+  out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
+  assert_contains "$out" "could not confirm"
+  assert_not_contains "$(cat "$TMP/curl.log")" "torrents/delete"
+}
+
+test_command_endpoint_failing_never_counts_as_idle() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
+  export MEDIACTL_POLL_SECS=0
+  resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  hist_for ABC 1
+  : > "$TMP/resp/FAIL_GET__api_v3_command"
+  out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
+  assert_contains "$out" "could not read command status from radarr; torrents left in place"
+  assert_not_contains "$(cat "$TMP/curl.log")" "torrents/delete"
+}
+
+test_transient_command_failure_then_idle_deletes() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
+  export MEDIACTL_POLL_SECS=0
+  resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  hist_for ABC 1
+  printf 2 > "$TMP/resp/FAILN_GET__api_v3_command"
+  out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
+  assert_contains "$out" "Waiting for Radarr/Sonarr to finish moving files..."
   assert_contains "$(cat "$TMP/curl.log")" "torrents/delete"
 }
