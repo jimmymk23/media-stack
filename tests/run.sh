@@ -5,7 +5,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export ROOT
 
-fail() { echo "    FAIL: $*" >&2; return 1; }
+fail() { echo "    FAIL: $*" >&2; exit 1; }
 assert_eq() { if [ "$1" != "$2" ]; then fail "expected [$1] got [$2]"; fi; }
 assert_contains() { case "$1" in *"$2"*) ;; *) fail "expected output to contain [$2], got [$1]";; esac; }
 assert_not_contains() { case "$1" in *"$2"*) fail "expected output NOT to contain [$2], got [$1]";; *) ;; esac; }
