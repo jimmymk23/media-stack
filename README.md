@@ -58,7 +58,7 @@ Container paths are the same in every mode, so Radarr, Sonarr and Jellyfin need 
 
 Notes:
 
-- `sync` needs a hardlink-preserving rsync. The macOS built-in one passes the check on tested machines; if it ever fails, run `brew install rsync` once and set `MEDIACTL_RSYNC=$(brew --prefix)/bin/rsync` in `.env`. It refuses to run if `DATA_ROOT` and `INTERNAL_DATA_ROOT` overlap or free space is short. If it stops midway the stack stays stopped; run `./mediactl up`.
+- `sync` needs a hardlink-preserving rsync. The macOS built-in one passes the check on tested machines; if it ever fails, run `brew install rsync` once and prefix the command with the override, e.g. `MEDIACTL_RSYNC=/opt/homebrew/bin/rsync ./mediactl sync --yes` (Intel Macs: `/usr/local/bin/rsync`). `MEDIACTL_RSYNC`, `MEDIACTL_MOVE_TIMEOUT` (default 900s) and `MEDIACTL_POLL_SECS` (default 5) are shell environment variables, not `.env` settings. It refuses to run if `DATA_ROOT` and `INTERNAL_DATA_ROOT` overlap or free space is short. If it stops midway the stack stays stopped; run `./mediactl up`.
 - Archiving frees no space until the seeding torrent is removed. `--remove-torrents` lists the torrents (name, size, save path), waits for the Radarr/Sonarr move to finish, skips torrents shared with titles you are not archiving, and leaves a torrent in place if anything cannot be confirmed. It needs `QBIT_USER`/`QBIT_PASSWORD`.
 
 First-time archive flow:
