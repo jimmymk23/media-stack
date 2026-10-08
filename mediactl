@@ -114,6 +114,7 @@ cmd_up() {
     printf '%q ' "${cmd[@]}"; echo
     return 0
   fi
+  acquire_lock
   make_layout "$ACTIVE_ROOT"
   if [ "$WITH_ARCHIVE" -eq 1 ]; then mkdir -p "$ARCHIVE_ROOT/movies" "$ARCHIVE_ROOT/tv"; fi
   (cd "$MEDIACTL_DIR" && "${cmd[@]}")
@@ -154,7 +155,7 @@ list_titles() {
 
 count_kind() { list_titles "$1" | awk -F'\t' -v k="$2" '$1==k{n++} END{print n+0}'; }
 
-free_space() { df -h "$(volume_of "$1")" | awk 'NR==2{print $4}'; }
+free_space() { df -hP "$(volume_of "$1")" | awk 'NR==2{print $4}'; }
 
 running_data_root() {
   "$DOCKER" inspect radarr \
@@ -197,17 +198,20 @@ cmd_status() {
 }
 
 # ------------------------------------------------------------------ sync
-release_lock() { rm -rf "$LOCK_DIR"; }
+LOCK_HELD=0
+release_lock() { LOCK_HELD=0; rm -rf "$LOCK_DIR"; }
 
+# acquire_lock: reentrant within one process (cmd_sync holds it while calling cmd_up).
 acquire_lock() {
+  if [ "$LOCK_HELD" -eq 1 ]; then return 0; fi
   if mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo $$ > "$LOCK_DIR/pid"; trap release_lock EXIT; return 0
+    echo $$ > "$LOCK_DIR/pid"; LOCK_HELD=1; trap release_lock EXIT; return 0
   fi
   local pid; pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     die "another mediactl is running (pid $pid)"
   fi
-  rm -rf "$LOCK_DIR"; mkdir "$LOCK_DIR"; echo $$ > "$LOCK_DIR/pid"; trap release_lock EXIT
+  rm -rf "$LOCK_DIR"; mkdir "$LOCK_DIR"; echo $$ > "$LOCK_DIR/pid"; LOCK_HELD=1; trap release_lock EXIT
 }
 
 # macOS ships openrsync, which may not preserve hardlinks; prove it before moving data.
@@ -222,7 +226,7 @@ rsync_preserves_hardlinks() {
   [ "$ia" = "$ib" ]
 }
 
-free_kb() { df -k "$(volume_of "$1")" | awk 'NR==2{print $4}'; }
+free_kb() { df -kP "$(volume_of "$1")" | awk 'NR==2{print $4}'; }
 
 manifest() { # manifest ROOT: sorted "size path" for every file under torrents/ and media/
   (cd "$1" && { find torrents media -type f -exec stat -f '%z %N' {} + 2>/dev/null || true; } | sort)
@@ -246,11 +250,41 @@ resolve_path() { # resolve_path P: physical path; a not-yet-existing tail is app
   printf '%s%s' "$(cd "$p" && pwd -P)" "$tail"
 }
 
-roots_are_disjoint() { # die if the two roots are equal, nested, or symlinked into each other
-  local a b
+# existing_ids P: "device:inode" of P and of each of its existing ancestors up to /.
+existing_ids() {
+  local p=$1 up
+  while true; do
+    if [ -e "$p" ]; then stat -f %d:%i "$p" 2>/dev/null || true; fi
+    up=$(dirname "$p")
+    if [ "$up" = "$p" ]; then break; fi
+    p=$up
+  done
+}
+
+# roots_are_disjoint A B: die if either root has a '..' component, or if they are equal,
+# nested, symlinked into each other, or the same directory spelled with different case.
+# Identity (device:inode) is compared, so case-insensitive filesystems cannot fool it.
+roots_are_disjoint() {
+  local r a b ida idb
+  for r in "$1" "$2"; do
+    case "/$r/" in */../*) die "root path contains '..': $r; refusing to sync" ;; esac
+  done
   a=$(resolve_path "$1"); b=$(resolve_path "$2")
   case "$a/" in "$b"/*) die "INTERNAL_DATA_ROOT and DATA_ROOT overlap ($a vs $b); refusing to sync" ;; esac
   case "$b/" in "$a"/*) die "INTERNAL_DATA_ROOT and DATA_ROOT overlap ($a vs $b); refusing to sync" ;; esac
+  # A root that does not exist yet has no identity of its own, but its existing ancestors count.
+  if [ -e "$1" ]; then
+    ida=$(stat -f %d:%i "$1" 2>/dev/null || true)
+    if [ -n "$ida" ] && existing_ids "$2" | grep -qxF "$ida"; then
+      die "INTERNAL_DATA_ROOT and DATA_ROOT overlap ($1 vs $2); refusing to sync"
+    fi
+  fi
+  if [ -e "$2" ]; then
+    idb=$(stat -f %d:%i "$2" 2>/dev/null || true)
+    if [ -n "$idb" ] && existing_ids "$1" | grep -qxF "$idb"; then
+      die "INTERNAL_DATA_ROOT and DATA_ROOT overlap ($1 vs $2); refusing to sync"
+    fi
+  fi
 }
 
 SYNC_STOPPED=0
@@ -312,6 +346,7 @@ cmd_sync() {
   local need free
   need=$(du -sk "$INTERNAL_ROOT/torrents" "$INTERNAL_ROOT/media" 2>/dev/null | awk '{s+=$1} END{print s+0}')
   free=$(free_kb "$SSD_ROOT")
+  case "$free" in ''|*[!0-9]*) die "could not read free space on the SSD (got '$free'); refusing to sync" ;; esac
   if [ "$need" -gt "$free" ]; then
     die "not enough free space on the SSD: need ${need}K, have ${free}K"
   fi
@@ -321,13 +356,15 @@ cmd_sync() {
   if [ "$yes" -ne 1 ]; then echo "Dry run only. Re-run with --yes to move."; return 0; fi
 
   acquire_lock
-  echo "Stopping qbittorrent, radarr, sonarr..."
-  compose_cmd stop qbittorrent radarr sonarr
+  # The tail of SSD_ROOT may not exist yet; create it, then re-check before touching the stack.
+  mkdir -p "$SSD_ROOT"
+  roots_are_disjoint "$INTERNAL_ROOT" "$SSD_ROOT"
+  echo "Stopping qbittorrent, radarr, sonarr, jellyfin..."
+  compose_cmd stop qbittorrent radarr sonarr jellyfin
   SYNC_STOPPED=1
   trap sync_exit EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  mkdir -p "$SSD_ROOT"
   echo "Copying (hardlinks preserved)..."
   "$RSYNC" -aH "$INTERNAL_ROOT/" "$SSD_ROOT/" \
     || die "rsync failed; internal files are untouched. Run: mediactl up, then retry sync"
@@ -356,12 +393,56 @@ jellyfin_api() { # jellyfin_api METHOD PATH [JSON]
 require_archive_ready() {
   if [ -z "$ARCHIVE_ROOT" ]; then die "ARCHIVE_ROOT is not set in .env"; fi
   if ! is_mounted "$ARCHIVE_ROOT"; then die "archive drive is not mounted ($(volume_of "$ARCHIVE_ROOT"))"; fi
-  local dest
-  dest=$("$DOCKER" inspect radarr --format '{{range .Mounts}}{{.Destination}} {{end}}' 2>/dev/null) || dest=""
-  case " $dest " in
-    *" /data/archive "*) ;;
-    *) die "Radarr does not have the archive mounted; run: mediactl up --archive" ;;
+  # Radarr and Sonarr both move files, so both need the mount (Jellyfin is read-only and optional).
+  local app dest
+  for app in radarr sonarr; do
+    dest=$("$DOCKER" inspect "$app" --format '{{range .Mounts}}{{.Destination}} {{end}}' 2>/dev/null) || dest=""
+    case " $dest " in
+      *" /data/archive "*) ;;
+      *) die "$app does not have the archive mounted; run: mediactl up --archive" ;;
+    esac
+  done
+}
+
+# host_path_for DBPATH RUNNING_ROOT: the host folder behind a Radarr/Sonarr path (empty if unmapped).
+host_path_for() {
+  case "$1" in
+    /data/media/*) printf '%s/media/%s' "$2" "${1#/data/media/}" ;;
+    /data/archive/*) printf '%s/%s' "$ARCHIVE_ROOT" "${1#/data/archive/}" ;;
   esac
+}
+
+# check_title_folders WORKDIR RUNNING_ROOT DIR: refuse unless every matched title's folder is on
+# a mounted drive; then refuse if the destination drive cannot hold them.
+check_title_folders() {
+  local work=$1 running=$2 dir=$3 path host missing="" total=0 kb
+  local hosts="$work/hosts"; : > "$hosts"
+  while IFS= read -r path; do
+    host=$(host_path_for "$path" "$running")
+    if [ -z "$host" ] || [ ! -d "$host" ]; then
+      missing="$missing
+  $path -> ${host:-(unmapped path)}"
+    else
+      printf '%s\n' "$host" >> "$hosts"
+    fi
+  done < <(cat "$work/radarr.jsonl" "$work/sonarr.jsonl" | jq -r '.path')
+  if [ -n "$missing" ]; then
+    rm -rf "$work"
+    die "these titles are not on a mounted drive, so nothing was changed:$missing
+Plug in the drive and run: ./mediactl up   (then retry)"
+  fi
+  while IFS= read -r host; do
+    kb=$(du -sk "$host" 2>/dev/null | awk '{print $1}')
+    total=$((total + ${kb:-0}))
+  done < "$hosts"
+  local dest_root dest_label free
+  if [ "$dir" = archive ]; then dest_root=$ARCHIVE_ROOT; dest_label="archive drive"
+  else dest_root=$running; dest_label="data drive"; fi
+  free=$(free_kb "$dest_root")
+  case "$free" in ''|*[!0-9]*) rm -rf "$work"; die "could not read free space on the $dest_label (got '$free'); nothing was changed" ;; esac
+  if [ "$total" -gt "$free" ]; then
+    rm -rf "$work"; die "not enough free space on the $dest_label: need ${total}K, have ${free}K; nothing was changed"
+  fi
 }
 
 cmd_init_archive() {
@@ -534,6 +615,11 @@ cmd_move() {
   if [ $((nm + ns)) -gt 25 ] && [ "$all" -ne 1 ]; then
     rm -rf "$work"; die "more than 25 titles matched: narrow the search, or pass --all to confirm"
   fi
+  local running; running=$(running_data_root)
+  if [ -z "$running" ]; then
+    rm -rf "$work"; die "the stack is not running, so the data root is unknown; run: ./mediactl up"
+  fi
+  check_title_folders "$work" "$running" "$dir"
   echo "Will $dir:"
   jq -r '"  movie  [\(.id)] \(.title) (\(.year))  \(.path)"' "$work/radarr.jsonl"
   jq -r '"  show   [\(.id)] \(.title) (\(.year))  \(.path)"' "$work/sonarr.jsonl"

@@ -72,7 +72,7 @@ test_sync_yes_moves_preserves_hardlinks_and_cleans_internal() {
   [ -z "$(find "$TMP/internal/torrents" "$TMP/internal/media" -type f)" ] || fail "internal files should be gone"
   [ -d "$TMP/internal/media/movies" ] || fail "internal layout skeleton should remain"
   log=$(cat "$TMP/docker.log")
-  assert_contains "$log" "compose --profile vpn stop qbittorrent radarr sonarr"
+  assert_contains "$log" "compose --profile vpn stop qbittorrent radarr sonarr jellyfin"
   assert_contains "$log" "up -d"
 }
 
@@ -85,7 +85,7 @@ test_sync_keeps_internal_when_verification_fails() {
   if out=$( (cmd_sync --yes) 2>&1 ); then fail "verification should fail"; fi
   assert_contains "$out" "verification failed"
   assert_contains "$out" "Run: mediactl up"
-  assert_contains "$(cat "$TMP/docker.log")" "stop qbittorrent radarr sonarr"
+  assert_contains "$(cat "$TMP/docker.log")" "stop qbittorrent radarr sonarr jellyfin"
   [ -f "$TMP/internal/torrents/movies/Don't Look Up (2021).mkv" ] || fail "internal copy must be kept"
 }
 
@@ -170,5 +170,89 @@ test_sync_success_prints_no_notice_and_releases_lock() {
   seed_internal
   out=$( (cmd_sync --yes) 2>&1 )
   assert_not_contains "$out" "did not finish"
+  [ ! -e "$LOCK_DIR" ] || fail "lock should be released"
+}
+
+# refused_untouched OUT_SUBSTRING [FILE]: sync must refuse, keep internal data, never stop the stack
+refused_untouched() {
+  local want=$1 file=${2:-"$TMP/internal/torrents/movies/Don't Look Up (2021).mkv"}
+  if out=$( (cmd_sync --yes) 2>&1 ); then fail "should refuse"; fi
+  assert_contains "$out" "$want"
+  [ -f "$file" ] || fail "internal data must be untouched"
+  if grep -q stop "$TMP/docker.log" 2>/dev/null; then fail "must not stop the stack"; fi
+}
+
+test_sync_refuses_case_variant_roots() {
+  mkdir "$TMP/CaseProbe"
+  if [ ! -d "$TMP/caseprobe" ]; then echo "SKIP: case-sensitive filesystem" >&2; return 0; fi
+  mkdir -p "$TMP/box/data"; make_layout "$TMP/box/data"
+  printf 'only-copy' > "$TMP/box/data/torrents/movies/x.mkv"
+  set_roots "$TMP/box/data" "$TMP/Box/data"
+  refused_untouched "overlap" "$TMP/box/data/torrents/movies/x.mkv"
+  assert_eq "only-copy" "$(cat "$TMP/box/data/torrents/movies/x.mkv")"
+}
+
+test_sync_refuses_dotdot_in_existing_path() {
+  seed_internal; set_roots "$TMP/internal" "$TMP/ssd/../internal"
+  refused_untouched "'..'"
+}
+
+test_sync_refuses_dotdot_in_missing_tail() {
+  seed_internal; set_roots "$TMP/internal" "$TMP/new/../internal"
+  refused_untouched "'..'"
+}
+
+test_sync_refuses_dotdot_in_internal_root() {
+  seed_internal; set_roots "$TMP/ssd/../internal" "$TMP/ssd"
+  refused_untouched "'..'"
+}
+
+test_sync_refuses_missing_ssd_tail_aliasing_internal_via_symlink() {
+  seed_internal; ln -s "$TMP/internal" "$TMP/link"
+  set_roots "$TMP/internal" "$TMP/link/data"
+  refused_untouched "overlap"
+}
+
+test_sync_dry_run_also_refuses_overlap() {
+  seed_internal; ln -s "$TMP/internal" "$TMP/link"
+  set_roots "$TMP/internal" "$TMP/link/data"
+  if out=$( (cmd_sync) 2>&1 ); then fail "dry run should refuse too"; fi
+  assert_contains "$out" "overlap"
+}
+
+test_sync_refuses_when_free_space_is_empty() {
+  seed_internal
+  free_kb() { echo ""; }
+  refused_untouched "free space"
+}
+
+test_sync_refuses_when_free_space_is_not_numeric() {
+  seed_internal
+  free_kb() { echo "abc"; }
+  refused_untouched "free space"
+}
+
+test_up_refuses_while_another_mediactl_holds_the_lock() {
+  sleep 30 & live=$!
+  mkdir "$LOCK_DIR"; echo "$live" > "$LOCK_DIR/pid"
+  if out=$( (cmd_up) 2>&1 ); then kill "$live"; fail "up should refuse under a live lock"; fi
+  kill "$live"
+  assert_contains "$out" "another mediactl is running"
+  if grep -q "up -d" "$TMP/docker.log" 2>/dev/null; then fail "must not start containers"; fi
+}
+
+test_up_dry_run_ignores_the_lock() {
+  sleep 30 & live=$!
+  mkdir "$LOCK_DIR"; echo "$live" > "$LOCK_DIR/pid"
+  out=$( (cmd_up --dry-run) 2>&1 ) || { kill "$live"; fail "dry run should not need the lock"; }
+  kill "$live"
+}
+
+test_up_releases_its_lock_and_is_reentrant_under_sync() {
+  need_hardlink_rsync || return 0
+  seed_internal
+  out=$( (cmd_sync --yes) 2>&1 ) || fail "sync must not deadlock on its own lock: $out"
+  assert_contains "$(cat "$TMP/docker.log")" "up -d"
+  ( cmd_up >/dev/null ) || fail "up should run"
   [ ! -e "$LOCK_DIR" ] || fail "lock should be released"
 }

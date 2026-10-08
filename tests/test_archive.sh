@@ -1,4 +1,11 @@
-archive_ready() { printf '/data /data/archive ' > "$TMP/docker_inspect"; }
+# archive_ready: archive mounted in the containers, stack running on $TMP/ssd, and the
+# fixture titles present on disk (media titles on the SSD, Alien on the archive drive).
+archive_ready() {
+  printf '/data /data/archive ' > "$TMP/docker_inspect"
+  printf '%s' "$TMP/ssd" > "$TMP/docker_inspect_src"
+  mkdir -p "$TMP/ssd/media/movies/Heat (1995)" "$TMP/ssd/media/movies/Heat Wave (2020)" \
+           "$TMP/ssd/media/tv/The Wire" "$TMP/archive/movies/Alien (1979)"
+}
 
 test_require_archive_ready_checks_drive_and_container_mount() {
   printf '/data ' > "$TMP/docker_inspect"
@@ -144,6 +151,8 @@ big_movies() { # 26 archivable titles
   seq 1 26 | jq -R -s -c 'split("\n") | map(select(length>0) | tonumber | {id:., title:("Film "+tostring), year:2000, path:("/data/media/movies/Film "+tostring)})'
 }
 
+big_folders() { local i; for i in $(seq 1 26); do mkdir -p "$TMP/ssd/media/movies/Film $i"; done; }
+
 test_empty_term_refused_before_any_call() {
   archive_ready
   if out=$( (cmd_move archive "" --yes) 2>&1 ); then fail "should refuse"; fi
@@ -165,14 +174,14 @@ test_match_count_line_is_printed() {
 }
 
 test_more_than_25_matches_refused_without_all() {
-  archive_ready; resp "GET /api/v3/movie" "$(big_movies)"
+  archive_ready; big_folders; resp "GET /api/v3/movie" "$(big_movies)"
   if out=$( (cmd_move archive Film --yes) 2>&1 ); then fail "should refuse"; fi
   assert_contains "$out" "--all"
   assert_not_contains "$(cat "$TMP/curl.log")" "/movie/editor"
 }
 
 test_more_than_25_matches_allowed_with_all() {
-  archive_ready; resp "GET /api/v3/movie" "$(big_movies)"
+  archive_ready; big_folders; resp "GET /api/v3/movie" "$(big_movies)"
   out=$(cmd_move archive Film --yes --all)
   assert_contains "$out" "Matched: 26 movie(s)"
   assert_contains "$(cat "$TMP/curl.log")" "/movie/editor"
@@ -297,4 +306,76 @@ test_transient_command_failure_then_idle_deletes() {
   out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
   assert_contains "$out" "Waiting for Radarr/Sonarr to finish moving files..."
   assert_contains "$(cat "$TMP/curl.log")" "torrents/delete"
+}
+
+test_require_archive_ready_checks_sonarr_mount_too() {
+  archive_ready
+  printf '/data ' > "$TMP/docker_inspect_sonarr"
+  if out=$( (load_config; require_archive_ready) 2>&1 ); then fail "sonarr without the mount must refuse"; fi
+  assert_contains "$out" "sonarr"
+  assert_contains "$out" "mediactl up --archive"
+  printf '/data /data/archive ' > "$TMP/docker_inspect_sonarr"
+  (load_config; require_archive_ready) || fail "should pass when both have the mount"
+}
+
+test_archive_refuses_when_title_folder_missing_and_changes_nothing() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"; resp "GET /api/v3/series" "$SERIES"
+  rmdir "$TMP/ssd/media/movies/Heat Wave (2020)"
+  if out=$( (cmd_move archive Heat Wire --yes --remove-torrents) 2>&1 ); then fail "should refuse"; fi
+  assert_contains "$out" "Heat Wave (2020)"
+  assert_contains "$out" "$TMP/ssd/media/movies/Heat Wave (2020)"
+  assert_contains "$out" "mediactl up"
+  log=$(cat "$TMP/curl.log" 2>/dev/null || true)
+  assert_not_contains "$log" "/editor"
+  assert_not_contains "$log" "torrents/delete"
+}
+
+test_restore_refuses_when_archive_folder_missing() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  rmdir "$TMP/archive/movies/Alien (1979)"
+  if out=$( (cmd_move restore Alien --yes) 2>&1 ); then fail "should refuse"; fi
+  assert_contains "$out" "$TMP/archive/movies/Alien (1979)"
+  assert_not_contains "$(cat "$TMP/curl.log" 2>/dev/null || true)" "/editor"
+}
+
+test_archive_refuses_when_stack_not_running() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  : > "$TMP/docker_inspect_src"
+  if out=$( (cmd_move archive Heat --yes) 2>&1 ); then fail "should refuse"; fi
+  assert_contains "$out" "not running"
+  assert_not_contains "$(cat "$TMP/curl.log" 2>/dev/null || true)" "/editor"
+}
+
+test_archive_refuses_when_archive_drive_lacks_space() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  head -c 204800 /dev/zero > "$TMP/ssd/media/movies/Heat (1995)/a.mkv"
+  free_kb() { echo 10; }
+  if out=$( (cmd_move archive "Heat (1995)" --yes) 2>&1 ); then fail "should refuse"; fi
+  assert_contains "$out" "not enough free space on the archive drive"
+  assert_not_contains "$(cat "$TMP/curl.log" 2>/dev/null || true)" "/editor"
+}
+
+test_archive_proceeds_when_archive_drive_has_space() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  head -c 204800 /dev/zero > "$TMP/ssd/media/movies/Heat (1995)/a.mkv"
+  free_kb() { echo 99999999; }
+  cmd_move archive "Heat (1995)" --yes >/dev/null
+  assert_contains "$(cat "$TMP/curl.log")" '"movieIds":[1]'
+}
+
+test_restore_refuses_when_data_root_lacks_space() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  head -c 204800 /dev/zero > "$TMP/archive/movies/Alien (1979)/a.mkv"
+  free_kb() { echo 10; }
+  if out=$( (cmd_move restore Alien --yes) 2>&1 ); then fail "should refuse"; fi
+  assert_contains "$out" "not enough free space"
+  assert_not_contains "$(cat "$TMP/curl.log" 2>/dev/null || true)" "/editor"
+}
+
+test_archive_refuses_when_free_space_unreadable() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  free_kb() { echo ""; }
+  if out=$( (cmd_move archive "Heat (1995)" --yes) 2>&1 ); then fail "should refuse"; fi
+  assert_contains "$out" "free space"
+  assert_not_contains "$(cat "$TMP/curl.log" 2>/dev/null || true)" "/editor"
 }

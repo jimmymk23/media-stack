@@ -30,7 +30,16 @@ setup_env() {
   cat > "$TMP/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$TMP/docker.log"
-if [ "$1" = inspect ]; then cat "$TMP/docker_inspect" 2>/dev/null || true; fi
+if [ "$1" = inspect ]; then
+  # Source queries read docker_inspect_src (falls back to docker_inspect);
+  # Destination queries read docker_inspect_<container> (falls back to docker_inspect).
+  f="$TMP/docker_inspect"
+  case "$*" in
+    *.Source*) if [ -f "$TMP/docker_inspect_src" ]; then f="$TMP/docker_inspect_src"; fi ;;
+    *) if [ -f "$TMP/docker_inspect_$2" ]; then f="$TMP/docker_inspect_$2"; fi ;;
+  esac
+  cat "$f" 2>/dev/null || true
+fi
 exit 0
 EOF
   cat > "$TMP/bin/curl" <<'EOF'
