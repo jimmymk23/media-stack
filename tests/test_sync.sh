@@ -84,6 +84,8 @@ test_sync_keeps_internal_when_verification_fails() {
   rsync_preserves_hardlinks() { return 0; }
   if out=$( (cmd_sync --yes) 2>&1 ); then fail "verification should fail"; fi
   assert_contains "$out" "verification failed"
+  assert_contains "$out" "Run: mediactl up"
+  assert_contains "$(cat "$TMP/docker.log")" "stop qbittorrent radarr sonarr"
   [ -f "$TMP/internal/torrents/movies/Don't Look Up (2021).mkv" ] || fail "internal copy must be kept"
 }
 
@@ -108,4 +110,65 @@ test_sync_triggers_rescans_when_keys_present() {
   log=$(cat "$TMP/curl.log")
   assert_contains "$log" "RescanMovie"
   assert_contains "$log" "RescanSeries"
+}
+
+set_roots() { # set_roots INTERNAL SSD
+  printf 'DATA_ROOT=%s\nINTERNAL_DATA_ROOT=%s\nARCHIVE_ROOT=%s\nRADARR_API_KEY=rk\nSONARR_API_KEY=sk\n' \
+    "$2" "$1" "$TMP/archive" > "$TMP/.env"
+  MEDIACTL_FAKE_MOUNTED="$2"
+}
+
+assert_overlap_refused() {
+  if out=$( (cmd_sync --yes) 2>&1 ); then fail "overlapping roots should refuse"; fi
+  assert_contains "$out" "overlap"
+  [ -f "$TMP/internal/torrents/movies/Don't Look Up (2021).mkv" ] || fail "internal data must be untouched"
+  if grep -q stop "$TMP/docker.log" 2>/dev/null; then fail "must not stop the stack"; fi
+}
+
+test_sync_refuses_equal_roots() {
+  seed_internal; set_roots "$TMP/internal" "$TMP/internal"
+  assert_overlap_refused
+}
+
+test_sync_refuses_internal_nested_in_ssd() {
+  seed_internal; set_roots "$TMP/internal" "$TMP"
+  assert_overlap_refused
+}
+
+test_sync_refuses_ssd_nested_in_internal() {
+  seed_internal; set_roots "$TMP/internal" "$TMP/internal/sub/ssd"
+  assert_overlap_refused
+}
+
+test_sync_refuses_ssd_symlink_to_internal() {
+  seed_internal; rmdir "$TMP/ssd"; ln -s "$TMP/internal" "$TMP/ssd"
+  set_roots "$TMP/internal" "$TMP/ssd"
+  assert_overlap_refused
+}
+
+test_sync_allows_sibling_prefix_roots() {
+  need_hardlink_rsync || return 0
+  mkdir -p "$TMP/ssd2"; seed_internal; set_roots "$TMP/ssd" "$TMP/ssd2"
+  rmdir "$TMP/ssd"; mv "$TMP/internal" "$TMP/ssd"
+  out=$(cmd_sync --yes 2>&1) || fail "sibling roots should be allowed: $out"
+  [ -f "$TMP/ssd2/torrents/movies/Don't Look Up (2021).mkv" ] || fail "file not copied"
+}
+
+test_sync_failure_after_stop_prints_recovery_notice() {
+  seed_internal
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/bin/rsync"; chmod +x "$TMP/bin/rsync"
+  RSYNC="$TMP/bin/rsync"
+  rsync_preserves_hardlinks() { return 0; }
+  if out=$( (cmd_sync --yes) 2>&1 ); then fail "should fail"; fi
+  assert_contains "$out" "sync did not finish. The stack is stopped. Run: mediactl up"
+  [ -f "$TMP/internal/torrents/movies/Don't Look Up (2021).mkv" ] || fail "internal copy must be kept"
+  [ ! -e "$LOCK_DIR" ] || fail "lock should be released"
+}
+
+test_sync_success_prints_no_notice_and_releases_lock() {
+  need_hardlink_rsync || return 0
+  seed_internal
+  out=$( (cmd_sync --yes) 2>&1 )
+  assert_not_contains "$out" "did not finish"
+  [ ! -e "$LOCK_DIR" ] || fail "lock should be released"
 }

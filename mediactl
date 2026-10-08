@@ -232,9 +232,35 @@ verify_copy() { # verify_copy SRC DST: every source file exists at the destinati
   local missing
   missing=$(comm -23 <(manifest "$1") <(manifest "$2"))
   if [ -n "$missing" ]; then
-    die "verification failed, internal copies kept. Differences:
+    die "verification failed, internal copies kept. Run: mediactl up
+Differences:
 $missing"
   fi
+}
+
+resolve_path() { # resolve_path P: physical path; a not-yet-existing tail is appended to its nearest existing ancestor
+  local p=$1 tail="" base
+  while [ ! -d "$p" ] && [ "$p" != "/" ] && [ "$p" != "." ]; do
+    base=$(basename "$p"); tail="/$base$tail"; p=$(dirname "$p")
+  done
+  printf '%s%s' "$(cd "$p" && pwd -P)" "$tail"
+}
+
+roots_are_disjoint() { # die if the two roots are equal, nested, or symlinked into each other
+  local a b
+  a=$(resolve_path "$1"); b=$(resolve_path "$2")
+  case "$a/" in "$b"/*) die "INTERNAL_DATA_ROOT and DATA_ROOT overlap ($a vs $b); refusing to sync" ;; esac
+  case "$b/" in "$a"/*) die "INTERNAL_DATA_ROOT and DATA_ROOT overlap ($a vs $b); refusing to sync" ;; esac
+}
+
+SYNC_STOPPED=0
+sync_exit() {
+  local rc=$?
+  if [ "$SYNC_STOPPED" -eq 1 ]; then
+    echo "mediactl: sync did not finish. The stack is stopped. Run: mediactl up   (internal files are only deleted after the copy is verified)" >&2
+  fi
+  release_lock
+  return $rc
 }
 
 wait_for_http() { # wait_for_http URL: up to ~60s
@@ -274,6 +300,7 @@ cmd_sync() {
   if ! is_mounted "$SSD_ROOT"; then
     die "external SSD is not mounted ($(volume_of "$SSD_ROOT")); nothing to sync to"
   fi
+  roots_are_disjoint "$INTERNAL_ROOT" "$SSD_ROOT"
   local count
   count=$( { find "$INTERNAL_ROOT/torrents" "$INTERNAL_ROOT/media" -type f 2>/dev/null || true; } | wc -l | tr -d ' ')
   if [ "$count" -eq 0 ]; then echo "Nothing to sync: no files under $INTERNAL_ROOT"; return 0; fi
@@ -296,6 +323,10 @@ cmd_sync() {
   acquire_lock
   echo "Stopping qbittorrent, radarr, sonarr..."
   compose_cmd stop qbittorrent radarr sonarr
+  SYNC_STOPPED=1
+  trap sync_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   mkdir -p "$SSD_ROOT"
   echo "Copying (hardlinks preserved)..."
   "$RSYNC" -aH "$INTERNAL_ROOT/" "$SSD_ROOT/" \
@@ -306,6 +337,7 @@ cmd_sync() {
   make_layout "$INTERNAL_ROOT"
   echo "Restarting stack on the SSD..."
   cmd_up
+  SYNC_STOPPED=0
   refresh_apps
   echo "Sync complete."
 }
