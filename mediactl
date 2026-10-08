@@ -342,6 +342,63 @@ cmd_sync() {
   echo "Sync complete."
 }
 
+# ------------------------------------------------------- archive support
+jellyfin_api() { # jellyfin_api METHOD PATH [JSON]
+  local method=$1 path=$2 body=${3:-} key
+  key=$(env_get JELLYFIN_API_KEY)
+  if [ -z "$key" ]; then die "JELLYFIN_API_KEY is not set in .env"; fi
+  local args=(-fsS -X "$method" -H "X-Emby-Token: $key" -H "Content-Type: application/json")
+  if [ -n "$body" ]; then args+=(-d "$body"); fi
+  "$CURL" "${args[@]}" "http://localhost:8096$path"
+}
+
+# require_archive_ready: needs load_config first.
+require_archive_ready() {
+  if [ -z "$ARCHIVE_ROOT" ]; then die "ARCHIVE_ROOT is not set in .env"; fi
+  if ! is_mounted "$ARCHIVE_ROOT"; then die "archive drive is not mounted ($(volume_of "$ARCHIVE_ROOT"))"; fi
+  local dest
+  dest=$("$DOCKER" inspect radarr --format '{{range .Mounts}}{{.Destination}} {{end}}' 2>/dev/null) || dest=""
+  case " $dest " in
+    *" /data/archive "*) ;;
+    *) die "Radarr does not have the archive mounted; run: mediactl up --archive" ;;
+  esac
+}
+
+cmd_init_archive() {
+  load_config
+  require_archive_ready
+  mkdir -p "$ARCHIVE_ROOT/movies" "$ARCHIVE_ROOT/tv"
+  local pair app path n
+  for pair in radarr:/data/archive/movies sonarr:/data/archive/tv; do
+    app=${pair%%:*}; path=${pair#*:}
+    n=$(arr_api "$app" GET /rootfolder | jq --arg p "$path" '[.[] | select(.path == $p or .path == ($p + "/"))] | length')
+    if [ "$n" -gt 0 ]; then
+      echo "$app: root folder $path already present"
+    else
+      arr_api "$app" POST /rootfolder "$(jq -nc --arg p "$path" '{path:$p}')" >/dev/null
+      echo "$app: added root folder $path"
+    fi
+  done
+  if [ -z "$(env_get JELLYFIN_API_KEY)" ]; then
+    echo "JELLYFIN_API_KEY not set: in Jellyfin add /data/archive/movies and /data/archive/tv to your libraries by hand (Dashboard > Libraries)."
+    return 0
+  fi
+  local movies_lib tv_lib folders
+  movies_lib=$(env_get JELLYFIN_MOVIES_LIBRARY Movies); tv_lib=$(env_get JELLYFIN_TV_LIBRARY Shows)
+  folders=$(jellyfin_api GET /Library/VirtualFolders)
+  for pair in "$movies_lib:/data/archive/movies" "$tv_lib:/data/archive/tv"; do
+    local lib=${pair%%:/*} p="/${pair#*:/}"
+    n=$(printf '%s' "$folders" | jq --arg l "$lib" --arg p "$p" '[.[] | select(.Name == $l and (.Locations | index($p)))] | length')
+    if [ "$n" -gt 0 ]; then
+      echo "jellyfin: $p already in library $lib"
+    else
+      jellyfin_api POST "/Library/VirtualFolders/Paths?refreshLibrary=true" \
+        "$(jq -nc --arg l "$lib" --arg p "$p" '{Name:$l, PathInfo:{Path:$p}}')" >/dev/null
+      echo "jellyfin: added $p to library $lib"
+    fi
+  done
+}
+
 # ------------------------------------------------------------- dispatcher
 usage() {
   cat <<'EOF'
@@ -363,6 +420,7 @@ main() {
     up) cmd_up "$@" ;;
     status) cmd_status ;;
     sync) cmd_sync "$@" ;;
+    init-archive) cmd_init_archive ;;
     *) usage >&2; die "unknown command: $cmd" ;;
   esac
 }
