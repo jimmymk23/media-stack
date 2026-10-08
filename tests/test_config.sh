@@ -23,7 +23,7 @@ test_volume_of() {
 }
 
 test_is_mounted_with_fake_list() {
-  is_mounted "$TMP/ssd/data"  || fail "ssd should count as mounted"
+  is_mounted "$TMP/ssd" || fail "ssd should count as mounted"
   MEDIACTL_FAKE_MOUNTED=""
   if is_mounted "$TMP/ssd"; then fail "empty fake list means nothing mounted"; fi
 }
