@@ -119,6 +119,83 @@ cmd_up() {
   (cd "$MEDIACTL_DIR" && "${cmd[@]}")
 }
 
+# ------------------------------------------------------------ app APIs
+arr_url() {
+  case "$1" in
+    radarr) echo "http://localhost:7878/api/v3" ;;
+    sonarr) echo "http://localhost:8989/api/v3" ;;
+    *) die "unknown app: $1" ;;
+  esac
+}
+
+# arr_api APP METHOD PATH [JSON_BODY]
+arr_api() {
+  local app=$1 method=$2 path=$3 body=${4:-} keyvar key
+  keyvar="$(printf '%s' "$app" | tr 'a-z' 'A-Z')_API_KEY"
+  key=$(env_get "$keyvar")
+  if [ -z "$key" ]; then die "$keyvar is not set in .env"; fi
+  local args=(-fsS -X "$method" -H "X-Api-Key: $key" -H "Content-Type: application/json")
+  if [ -n "$body" ]; then args+=(-d "$body"); fi
+  "$CURL" "${args[@]}" "$(arr_url "$app")$path"
+}
+
+# --------------------------------------------------------------- status
+# list_titles ROOT: "kind<TAB>name" per top-level folder in media/movies and media/tv.
+list_titles() {
+  local kind dir
+  for kind in movies tv; do
+    dir="$1/media/$kind"
+    if [ -d "$dir" ]; then
+      find "$dir" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort \
+        | while IFS= read -r name; do printf '%s\t%s\n' "$kind" "$name"; done
+    fi
+  done
+}
+
+count_kind() { list_titles "$1" | awk -F'\t' -v k="$2" '$1==k{n++} END{print n+0}'; }
+
+free_space() { df -h "$(volume_of "$1")" | awk 'NR==2{print $4}'; }
+
+running_data_root() {
+  "$DOCKER" inspect radarr \
+    --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null \
+    | sed 's#^/host_mnt##' || true
+}
+
+drive_line() { # drive_line LABEL PATH
+  local label=$1 path=$2 state free="-" movies="-" shows="-"
+  if is_mounted "$path"; then
+    state="mounted"; free=$(free_space "$path")
+    movies=$(count_kind "$path" movies); shows=$(count_kind "$path" tv)
+  else
+    state="NOT MOUNTED"
+  fi
+  printf '%-9s %-40s %-12s free %-6s movies %-4s tv %s\n' "$label" "$path" "$state" "$free" "$movies" "$shows"
+}
+
+cmd_status() {
+  load_config
+  local running; running=$(running_data_root)
+  if [ -n "$running" ]; then echo "Running data root: $running"; else echo "Running data root: (stack not running)"; fi
+  drive_line "SSD" "$SSD_ROOT"
+  drive_line "Internal" "$INTERNAL_ROOT"
+  if [ -n "$ARCHIVE_ROOT" ]; then drive_line "Archive" "$ARCHIVE_ROOT"; fi
+  if is_mounted "$SSD_ROOT" && [ -d "$INTERNAL_ROOT/media" ]; then
+    local m s; m=$(count_kind "$INTERNAL_ROOT" movies); s=$(count_kind "$INTERNAL_ROOT" tv)
+    if [ $((m + s)) -gt 0 ]; then
+      echo "Pending sync: $m movie(s), $s show(s) on internal -> run: mediactl sync"
+    fi
+  fi
+  if [ -n "$ARCHIVE_ROOT" ] && ! is_mounted "$ARCHIVE_ROOT"; then
+    local n=0 c
+    c=$(arr_api radarr GET /movie 2>/dev/null | jq '[.[] | select(.path | startswith("/data/archive/"))] | length' 2>/dev/null) || c=0
+    n=$((n + ${c:-0}))
+    c=$(arr_api sonarr GET /series 2>/dev/null | jq '[.[] | select(.path | startswith("/data/archive/"))] | length' 2>/dev/null) || c=0
+    n=$((n + ${c:-0}))
+    if [ "$n" -gt 0 ]; then echo "Archived titles offline: $n (plug in the archive drive and run: mediactl up)"; fi
+  fi
+}
+
 # ------------------------------------------------------------- dispatcher
 usage() {
   cat <<'EOF'
@@ -138,6 +215,7 @@ main() {
   case "$cmd" in
     help|-h|--help) usage ;;
     up) cmd_up "$@" ;;
+    status) cmd_status ;;
     *) usage >&2; die "unknown command: $cmd" ;;
   esac
 }
