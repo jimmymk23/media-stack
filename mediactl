@@ -55,6 +55,70 @@ is_mounted() {
   esac
 }
 
+# ------------------------------------------------------------ mode logic
+# resolve_plan [--main|--internal|--archive]: sets MODE, WITH_ARCHIVE, ACTIVE_ROOT.
+resolve_plan() {
+  local force_main=0 force_internal=0 force_archive=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --main) force_main=1 ;;
+      --internal) force_internal=1 ;;
+      --archive) force_archive=1 ;;
+      *) die "unknown option: $arg" ;;
+    esac
+  done
+  if [ "$force_main" -eq 1 ] && [ "$force_internal" -eq 1 ]; then
+    die "--main and --internal conflict"
+  fi
+  load_config
+  if [ "$force_internal" -eq 1 ]; then
+    MODE=internal
+  elif is_mounted "$SSD_ROOT"; then
+    MODE=main
+  elif [ "$force_main" -eq 1 ]; then
+    die "external SSD is not mounted ($(volume_of "$SSD_ROOT"))"
+  else
+    MODE=internal
+  fi
+  WITH_ARCHIVE=0
+  if [ -n "$ARCHIVE_ROOT" ] && is_mounted "$ARCHIVE_ROOT"; then
+    WITH_ARCHIVE=1
+  elif [ "$force_archive" -eq 1 ]; then
+    die "archive drive is not mounted (ARCHIVE_ROOT=${ARCHIVE_ROOT:-unset})"
+  fi
+  if [ "$MODE" = main ]; then ACTIVE_ROOT=$SSD_ROOT; else ACTIVE_ROOT=$INTERNAL_ROOT; fi
+}
+
+# compose_cmd ARGS...: run docker compose (vpn profile) from the repo directory.
+compose_cmd() { (cd "$MEDIACTL_DIR" && "$DOCKER" compose --profile vpn "$@"); }
+
+make_layout() { # make_layout ROOT
+  mkdir -p "$1/torrents/movies" "$1/torrents/tv" "$1/media/movies" "$1/media/tv"
+}
+
+cmd_up() {
+  local dry=0 arg flags=()
+  for arg in "$@"; do
+    if [ "$arg" = --dry-run ]; then dry=1; else flags+=("$arg"); fi
+  done
+  resolve_plan ${flags[@]+"${flags[@]}"}
+  local files=(-f docker-compose.yml) cmd=(env "DATA_ROOT=$ACTIVE_ROOT") note=""
+  if [ "$WITH_ARCHIVE" -eq 1 ]; then
+    files+=(-f docker-compose.archive.yml)
+    cmd+=("ARCHIVE_ROOT=$ARCHIVE_ROOT")
+    note=", archive: $ARCHIVE_ROOT"
+  fi
+  cmd+=("$DOCKER" compose --profile vpn "${files[@]}" up -d)
+  echo "Mode: $MODE (data root: $ACTIVE_ROOT$note)"
+  if [ "$dry" -eq 1 ]; then
+    printf '%q ' "${cmd[@]}"; echo
+    return 0
+  fi
+  make_layout "$ACTIVE_ROOT"
+  if [ "$WITH_ARCHIVE" -eq 1 ]; then mkdir -p "$ARCHIVE_ROOT/movies" "$ARCHIVE_ROOT/tv"; fi
+  (cd "$MEDIACTL_DIR" && "${cmd[@]}")
+}
+
 # ------------------------------------------------------------- dispatcher
 usage() {
   cat <<'EOF'
@@ -73,6 +137,7 @@ main() {
   if [ $# -gt 0 ]; then shift; fi
   case "$cmd" in
     help|-h|--help) usage ;;
+    up) cmd_up "$@" ;;
     *) usage >&2; die "unknown command: $cmd" ;;
   esac
 }

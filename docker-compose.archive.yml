@@ -1,0 +1,12 @@
+# Added by `mediactl up` only when the archive drive is mounted.
+# ARCHIVE_ROOT must contain movies/ and tv/ (mediactl creates them).
+services:
+  radarr:
+    volumes:
+      - ${ARCHIVE_ROOT:?ARCHIVE_ROOT is not set}:/data/archive
+  sonarr:
+    volumes:
+      - ${ARCHIVE_ROOT:?ARCHIVE_ROOT is not set}:/data/archive
+  jellyfin:
+    volumes:
+      - ${ARCHIVE_ROOT:?ARCHIVE_ROOT is not set}:/data/archive:ro
