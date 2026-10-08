@@ -35,6 +35,41 @@ Seerr ──► Radarr / Sonarr ──► Prowlarr ──► torrent indexers   
 - **Radarr, Sonarr, Seerr and Jellyfin** are *not* behind the VPN. They only talk to metadata services and to each other.
 - Because of this, other containers reach qBittorrent at `vpn:5080` and Prowlarr at `vpn:9696` (not `qbittorrent` / `prowlarr`).
 
+## Storage modes and mediactl
+
+`./mediactl` (a bash script, macOS with Docker Desktop only) starts the stack in the right storage mode for whichever drives are mounted and moves media between them. Copy `.env.example` to `.env` and fill in the storage and API key variables first.
+
+| Mode | Host folder behind `/data` | When |
+|------|----------------------------|------|
+| `main` | `DATA_ROOT` (external SSD) | SSD mounted |
+| `internal` | `INTERNAL_DATA_ROOT` | SSD unplugged (temporary) |
+| `archive` | adds `ARCHIVE_ROOT` at `/data/archive` | archive drive mounted (on top of main or internal) |
+
+Container paths are the same in every mode, so Radarr, Sonarr and Jellyfin need no reconfiguration.
+
+| Command | What it does |
+|---------|--------------|
+| `./mediactl up [--main\|--internal\|--archive] [--dry-run]` | Start the stack in the detected (or forced) mode |
+| `./mediactl status` | Drives, free space, running mode, pending sync |
+| `./mediactl sync [--yes]` | Move internal-drive media to the SSD. Dry run by default; verifies the copy before deleting internal files |
+| `./mediactl init-archive` | One-time: register the archive folders in Radarr, Sonarr and Jellyfin |
+| `./mediactl archive [--yes] [--all] [--remove-torrents] TITLE...` | Move titles to the archive drive. `--all` is needed if more than 25 titles match; non-interactive shells need `--yes` |
+| `./mediactl restore [--yes] [--all] TITLE...` | Move titles back from the archive drive |
+
+Notes:
+
+- `sync` needs a hardlink-preserving rsync. The macOS built-in one passes the check on tested machines; if it ever fails, run `brew install rsync` once and prefix the command with the override, e.g. `MEDIACTL_RSYNC=/opt/homebrew/bin/rsync ./mediactl sync --yes` (Intel Macs: `/usr/local/bin/rsync`). `MEDIACTL_RSYNC`, `MEDIACTL_MOVE_TIMEOUT` (default 900s) and `MEDIACTL_POLL_SECS` (default 5) are shell environment variables, not `.env` settings. It refuses to run if `DATA_ROOT` and `INTERNAL_DATA_ROOT` overlap (including case-only differences or `..` in the paths) or free space is short, and it briefly stops Jellyfin too. If it stops midway the stack stays stopped; run `./mediactl up`.
+- In internal or archive mode start the stack with `./mediactl up`, not plain `docker compose up -d`, which recreates containers on the `.env` `DATA_ROOT` and drops the archive mount. `archive`/`restore` refuse, changing nothing, if a matched title's folder is not on a mounted drive or the destination drive lacks space.
+- Archiving frees no space until the seeding torrent is removed. `--remove-torrents` lists the torrents (name, size, save path), waits for the Radarr/Sonarr move to finish, skips torrents shared with titles you are not archiving, and leaves a torrent in place if anything cannot be confirmed. It needs `QBIT_USER`/`QBIT_PASSWORD`.
+
+First-time archive flow:
+
+```bash
+./mediactl up --archive
+./mediactl init-archive
+./mediactl archive "Some Movie" --remove-torrents
+```
+
 ## Install media stack
 
 > **⚠️ Important Notice for Jellyseerr/Seerr Users:**

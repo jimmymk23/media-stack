@@ -1,0 +1,705 @@
+#!/usr/bin/env bash
+# mediactl: start the media stack in the right storage mode and move media
+# between the internal drive, the external SSD and the archive drive.
+# Run `mediactl help` for usage. Sourceable for tests (main only runs when executed).
+set -euo pipefail
+
+MEDIACTL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${MEDIACTL_ENV_FILE:-$MEDIACTL_DIR/.env}"
+DOCKER="${MEDIACTL_DOCKER:-docker}"
+CURL="${MEDIACTL_CURL:-curl}"
+RSYNC="${MEDIACTL_RSYNC:-rsync}"
+LOCK_DIR="${MEDIACTL_LOCK:-${TMPDIR:-/tmp}/mediactl.lock}"
+
+# ---------------------------------------------------------------- helpers
+die() { echo "mediactl: $*" >&2; exit 1; }
+
+# env_get KEY [DEFAULT]: environment wins, then .env, then DEFAULT. Never echoes secrets itself.
+env_get() {
+  local key=$1 def=${2:-} val=""
+  if [ -n "${!key:-}" ]; then printf '%s' "${!key}"; return 0; fi
+  if [ -f "$ENV_FILE" ]; then
+    val=$(grep -E "^${key}=" "$ENV_FILE" | tail -n1 | cut -d= -f2- \
+      | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//") || true
+  fi
+  if [ -n "$val" ]; then printf '%s' "$val"; else printf '%s' "$def"; fi
+}
+
+load_config() {
+  SSD_ROOT=$(env_get DATA_ROOT /Volumes/MediaServer/data)
+  INTERNAL_ROOT=$(env_get INTERNAL_DATA_ROOT "$HOME/media-stack-data")
+  ARCHIVE_ROOT=$(env_get ARCHIVE_ROOT "")
+}
+
+# ------------------------------------------------------- drive detection
+# volume_of PATH: the removable-volume root (/Volumes/<name>) or PATH itself.
+volume_of() {
+  case "$1" in
+    /Volumes/*) local rest=${1#/Volumes/}; printf '/Volumes/%s' "${rest%%/*}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+mount_table() { "${MEDIACTL_MOUNT_CMD:-mount}"; }
+
+# is_mounted PATH: true when the volume holding PATH is mounted. A leftover empty
+# /Volumes/<name> folder does not count; only the mount table does.
+is_mounted() {
+  local vol; vol=$(volume_of "$1")
+  if [ -n "${MEDIACTL_FAKE_MOUNTED+x}" ]; then
+    case ":$MEDIACTL_FAKE_MOUNTED:" in *":$vol:"*) return 0 ;; *) return 1 ;; esac
+  fi
+  case "$vol" in
+    /Volumes/*) mount_table | grep -qF " on $vol (" ;;
+    *) [ -d "$vol" ] ;;
+  esac
+}
+
+# ------------------------------------------------------------ mode logic
+# resolve_plan [--main|--internal|--archive]: sets MODE, WITH_ARCHIVE, ACTIVE_ROOT.
+resolve_plan() {
+  local force_main=0 force_internal=0 force_archive=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --main) force_main=1 ;;
+      --internal) force_internal=1 ;;
+      --archive) force_archive=1 ;;
+      *) die "unknown option: $arg" ;;
+    esac
+  done
+  if [ "$force_main" -eq 1 ] && [ "$force_internal" -eq 1 ]; then
+    die "--main and --internal conflict"
+  fi
+  load_config
+  if [ "$force_internal" -eq 1 ]; then
+    MODE=internal
+  elif is_mounted "$SSD_ROOT"; then
+    MODE=main
+  elif [ "$force_main" -eq 1 ]; then
+    die "external SSD is not mounted ($(volume_of "$SSD_ROOT"))"
+  else
+    MODE=internal
+  fi
+  WITH_ARCHIVE=0
+  if [ -n "$ARCHIVE_ROOT" ] && is_mounted "$ARCHIVE_ROOT"; then
+    WITH_ARCHIVE=1
+  elif [ "$force_archive" -eq 1 ]; then
+    die "archive drive is not mounted (ARCHIVE_ROOT=${ARCHIVE_ROOT:-unset})"
+  fi
+  if [ "$MODE" = main ]; then ACTIVE_ROOT=$SSD_ROOT; else ACTIVE_ROOT=$INTERNAL_ROOT; fi
+}
+
+# compose_cmd ARGS...: run docker compose (vpn profile) from the repo directory.
+compose_cmd() { (cd "$MEDIACTL_DIR" && "$DOCKER" compose --profile vpn "$@"); }
+
+make_layout() { # make_layout ROOT
+  mkdir -p "$1/torrents/movies" "$1/torrents/tv" "$1/media/movies" "$1/media/tv"
+}
+
+cmd_up() {
+  local dry=0 arg flags=()
+  for arg in "$@"; do
+    if [ "$arg" = --dry-run ]; then dry=1; else flags+=("$arg"); fi
+  done
+  resolve_plan ${flags[@]+"${flags[@]}"}
+  local files=(-f docker-compose.yml) cmd=(env "DATA_ROOT=$ACTIVE_ROOT") note=""
+  if [ "$WITH_ARCHIVE" -eq 1 ]; then
+    files+=(-f docker-compose.archive.yml)
+    cmd+=("ARCHIVE_ROOT=$ARCHIVE_ROOT")
+    note=", archive: $ARCHIVE_ROOT"
+  fi
+  cmd+=("$DOCKER" compose --profile vpn "${files[@]}" up -d)
+  echo "Mode: $MODE (data root: $ACTIVE_ROOT$note)"
+  if [ "$dry" -eq 1 ]; then
+    printf '%q ' "${cmd[@]}"; echo
+    return 0
+  fi
+  acquire_lock
+  make_layout "$ACTIVE_ROOT"
+  if [ "$WITH_ARCHIVE" -eq 1 ]; then mkdir -p "$ARCHIVE_ROOT/movies" "$ARCHIVE_ROOT/tv"; fi
+  (cd "$MEDIACTL_DIR" && "${cmd[@]}")
+}
+
+# ------------------------------------------------------------ app APIs
+arr_url() {
+  case "$1" in
+    radarr) echo "http://localhost:7878/api/v3" ;;
+    sonarr) echo "http://localhost:8989/api/v3" ;;
+    *) die "unknown app: $1" ;;
+  esac
+}
+
+# arr_api APP METHOD PATH [JSON_BODY]
+arr_api() {
+  local app=$1 method=$2 path=$3 body=${4:-} keyvar key
+  keyvar="$(printf '%s' "$app" | tr 'a-z' 'A-Z')_API_KEY"
+  key=$(env_get "$keyvar")
+  if [ -z "$key" ]; then die "$keyvar is not set in .env"; fi
+  local args=(-fsS -X "$method" -H "X-Api-Key: $key" -H "Content-Type: application/json")
+  if [ -n "$body" ]; then args+=(-d "$body"); fi
+  "$CURL" "${args[@]}" "$(arr_url "$app")$path"
+}
+
+# --------------------------------------------------------------- status
+# list_titles ROOT: "kind<TAB>name" per top-level folder in media/movies and media/tv.
+list_titles() {
+  local kind dir
+  for kind in movies tv; do
+    dir="$1/media/$kind"
+    if [ -d "$dir" ]; then
+      find "$dir" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort \
+        | while IFS= read -r name; do printf '%s\t%s\n' "$kind" "$name"; done
+    fi
+  done
+}
+
+count_kind() { list_titles "$1" | awk -F'\t' -v k="$2" '$1==k{n++} END{print n+0}'; }
+
+free_space() { df -hP "$(volume_of "$1")" | awk 'NR==2{print $4}'; }
+
+running_data_root() {
+  "$DOCKER" inspect radarr \
+    --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null \
+    | sed 's#^/host_mnt##' || true
+}
+
+drive_line() { # drive_line LABEL PATH
+  local label=$1 path=$2 state free="-" movies="-" shows="-"
+  if is_mounted "$path"; then
+    state="mounted"; free=$(free_space "$path")
+    movies=$(count_kind "$path" movies); shows=$(count_kind "$path" tv)
+  else
+    state="NOT MOUNTED"
+  fi
+  printf '%-9s %-40s %-12s free %-6s movies %-4s tv %s\n' "$label" "$path" "$state" "$free" "$movies" "$shows"
+}
+
+cmd_status() {
+  load_config
+  local running; running=$(running_data_root)
+  if [ -n "$running" ]; then echo "Running data root: $running"; else echo "Running data root: (stack not running)"; fi
+  drive_line "SSD" "$SSD_ROOT"
+  drive_line "Internal" "$INTERNAL_ROOT"
+  if [ -n "$ARCHIVE_ROOT" ]; then drive_line "Archive" "$ARCHIVE_ROOT"; fi
+  if is_mounted "$SSD_ROOT" && [ -d "$INTERNAL_ROOT/media" ]; then
+    local m s; m=$(count_kind "$INTERNAL_ROOT" movies); s=$(count_kind "$INTERNAL_ROOT" tv)
+    if [ $((m + s)) -gt 0 ]; then
+      echo "Pending sync: $m movie(s), $s show(s) on internal -> run: mediactl sync"
+    fi
+  fi
+  if [ -n "$ARCHIVE_ROOT" ] && ! is_mounted "$ARCHIVE_ROOT"; then
+    local n=0 c
+    c=$(arr_api radarr GET /movie 2>/dev/null | jq '[.[] | select(.path | startswith("/data/archive/"))] | length' 2>/dev/null) || c=0
+    n=$((n + ${c:-0}))
+    c=$(arr_api sonarr GET /series 2>/dev/null | jq '[.[] | select(.path | startswith("/data/archive/"))] | length' 2>/dev/null) || c=0
+    n=$((n + ${c:-0}))
+    if [ "$n" -gt 0 ]; then echo "Archived titles offline: $n (plug in the archive drive and run: mediactl up)"; fi
+  fi
+}
+
+# ------------------------------------------------------------------ sync
+LOCK_HELD=0
+release_lock() { LOCK_HELD=0; rm -rf "$LOCK_DIR"; }
+
+# acquire_lock: reentrant within one process (cmd_sync holds it while calling cmd_up).
+acquire_lock() {
+  if [ "$LOCK_HELD" -eq 1 ]; then return 0; fi
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ > "$LOCK_DIR/pid"; LOCK_HELD=1; trap release_lock EXIT; return 0
+  fi
+  local pid; pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    die "another mediactl is running (pid $pid)"
+  fi
+  rm -rf "$LOCK_DIR"; mkdir "$LOCK_DIR"; echo $$ > "$LOCK_DIR/pid"; LOCK_HELD=1; trap release_lock EXIT
+}
+
+# macOS ships openrsync, which may not preserve hardlinks; prove it before moving data.
+rsync_preserves_hardlinks() {
+  local d; d=$(mktemp -d)
+  mkdir "$d/src" "$d/dst"
+  echo x > "$d/src/a"; ln "$d/src/a" "$d/src/b"
+  "$RSYNC" -aH "$d/src/" "$d/dst/" >/dev/null 2>&1 || true
+  local ia ib
+  ia=$(stat -f %i "$d/dst/a" 2>/dev/null || echo 1); ib=$(stat -f %i "$d/dst/b" 2>/dev/null || echo 2)
+  rm -rf "$d"
+  [ "$ia" = "$ib" ]
+}
+
+free_kb() { df -kP "$(volume_of "$1")" | awk 'NR==2{print $4}'; }
+
+manifest() { # manifest ROOT: sorted "size path" for every file under torrents/ and media/
+  (cd "$1" && { find torrents media -type f -exec stat -f '%z %N' {} + 2>/dev/null || true; } | sort)
+}
+
+verify_copy() { # verify_copy SRC DST: every source file exists at the destination with the same size
+  local missing
+  missing=$(comm -23 <(manifest "$1") <(manifest "$2"))
+  if [ -n "$missing" ]; then
+    die "verification failed, internal copies kept. Run: mediactl up
+Differences:
+$missing"
+  fi
+}
+
+resolve_path() { # resolve_path P: physical path; a not-yet-existing tail is appended to its nearest existing ancestor
+  local p=$1 tail="" base
+  while [ ! -d "$p" ] && [ "$p" != "/" ] && [ "$p" != "." ]; do
+    base=$(basename "$p"); tail="/$base$tail"; p=$(dirname "$p")
+  done
+  printf '%s%s' "$(cd "$p" && pwd -P)" "$tail"
+}
+
+# existing_ids P: "device:inode" of P and of each of its existing ancestors up to /.
+existing_ids() {
+  local p=$1 up
+  while true; do
+    if [ -e "$p" ]; then stat -f %d:%i "$p" 2>/dev/null || true; fi
+    up=$(dirname "$p")
+    if [ "$up" = "$p" ]; then break; fi
+    p=$up
+  done
+}
+
+# roots_are_disjoint A B: die if either root has a '..' component, or if they are equal,
+# nested, symlinked into each other, or the same directory spelled with different case.
+# Identity (device:inode) is compared, so case-insensitive filesystems cannot fool it.
+roots_are_disjoint() {
+  local r a b ida idb
+  for r in "$1" "$2"; do
+    case "/$r/" in */../*) die "root path contains '..': $r; refusing to sync" ;; esac
+  done
+  a=$(resolve_path "$1"); b=$(resolve_path "$2")
+  case "$a/" in "$b"/*) die "INTERNAL_DATA_ROOT and DATA_ROOT overlap ($a vs $b); refusing to sync" ;; esac
+  case "$b/" in "$a"/*) die "INTERNAL_DATA_ROOT and DATA_ROOT overlap ($a vs $b); refusing to sync" ;; esac
+  # A root that does not exist yet has no identity of its own, but its existing ancestors count.
+  if [ -e "$1" ]; then
+    ida=$(stat -f %d:%i "$1" 2>/dev/null || true)
+    if [ -n "$ida" ] && existing_ids "$2" | grep -qxF "$ida"; then
+      die "INTERNAL_DATA_ROOT and DATA_ROOT overlap ($1 vs $2); refusing to sync"
+    fi
+  fi
+  if [ -e "$2" ]; then
+    idb=$(stat -f %d:%i "$2" 2>/dev/null || true)
+    if [ -n "$idb" ] && existing_ids "$1" | grep -qxF "$idb"; then
+      die "INTERNAL_DATA_ROOT and DATA_ROOT overlap ($1 vs $2); refusing to sync"
+    fi
+  fi
+}
+
+SYNC_STOPPED=0
+sync_exit() {
+  local rc=$?
+  if [ "$SYNC_STOPPED" -eq 1 ]; then
+    echo "mediactl: sync did not finish. The stack is stopped. Run: mediactl up   (internal files are only deleted after the copy is verified)" >&2
+  fi
+  release_lock
+  return $rc
+}
+
+wait_for_http() { # wait_for_http URL: up to ~60s
+  local i
+  for i in $(seq 1 30); do
+    if "$CURL" -fsS -o /dev/null "$1" 2>/dev/null; then return 0; fi
+    sleep 2
+  done
+  return 1
+}
+
+# refresh_apps: best-effort rescan so Radarr/Sonarr/Jellyfin notice files that appeared.
+refresh_apps() {
+  local jf; jf=$(env_get JELLYFIN_API_KEY)
+  if [ -n "$(env_get RADARR_API_KEY)" ]; then
+    wait_for_http "http://localhost:7878/ping" || echo "Radarr not reachable yet; rescan it from the UI"
+    arr_api radarr POST /command '{"name":"RescanMovie"}' >/dev/null || echo "Radarr rescan failed; run it from the UI"
+  fi
+  if [ -n "$(env_get SONARR_API_KEY)" ]; then
+    wait_for_http "http://localhost:8989/ping" || echo "Sonarr not reachable yet; rescan it from the UI"
+    arr_api sonarr POST /command '{"name":"RescanSeries"}' >/dev/null || echo "Sonarr rescan failed; run it from the UI"
+  fi
+  if [ -n "$jf" ]; then
+    "$CURL" -fsS -X POST -H "X-Emby-Token: $jf" "http://localhost:8096/Library/Refresh" >/dev/null \
+      || echo "Jellyfin refresh failed; scan libraries from the UI"
+  else
+    echo "JELLYFIN_API_KEY not set: scan Jellyfin libraries from the UI"
+  fi
+}
+
+cmd_sync() {
+  local yes=0 arg
+  for arg in "$@"; do
+    case "$arg" in --yes) yes=1 ;; *) die "unknown option: $arg" ;; esac
+  done
+  load_config
+  if ! is_mounted "$SSD_ROOT"; then
+    die "external SSD is not mounted ($(volume_of "$SSD_ROOT")); nothing to sync to"
+  fi
+  roots_are_disjoint "$INTERNAL_ROOT" "$SSD_ROOT"
+  local count
+  count=$( { find "$INTERNAL_ROOT/torrents" "$INTERNAL_ROOT/media" -type f 2>/dev/null || true; } | wc -l | tr -d ' ')
+  if [ "$count" -eq 0 ]; then echo "Nothing to sync: no files under $INTERNAL_ROOT"; return 0; fi
+
+  echo "Will move from $INTERNAL_ROOT to $SSD_ROOT:"
+  list_titles "$INTERNAL_ROOT" | while IFS="$(printf '\t')" read -r kind name; do echo "  [$kind] $name"; done
+  echo "  ($count file(s), including torrent data in torrents/)"
+
+  local need free
+  need=$(du -sk "$INTERNAL_ROOT/torrents" "$INTERNAL_ROOT/media" 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  free=$(free_kb "$SSD_ROOT")
+  case "$free" in ''|*[!0-9]*) die "could not read free space on the SSD (got '$free'); refusing to sync" ;; esac
+  if [ "$need" -gt "$free" ]; then
+    die "not enough free space on the SSD: need ${need}K, have ${free}K"
+  fi
+  if ! rsync_preserves_hardlinks; then
+    die "$RSYNC cannot preserve hardlinks. Run: brew install rsync, then set MEDIACTL_RSYNC=\$(brew --prefix)/bin/rsync"
+  fi
+  if [ "$yes" -ne 1 ]; then echo "Dry run only. Re-run with --yes to move."; return 0; fi
+
+  acquire_lock
+  # The tail of SSD_ROOT may not exist yet; create it, then re-check before touching the stack.
+  mkdir -p "$SSD_ROOT"
+  roots_are_disjoint "$INTERNAL_ROOT" "$SSD_ROOT"
+  echo "Stopping qbittorrent, radarr, sonarr, jellyfin..."
+  compose_cmd stop qbittorrent radarr sonarr jellyfin
+  SYNC_STOPPED=1
+  trap sync_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  echo "Copying (hardlinks preserved)..."
+  "$RSYNC" -aH "$INTERNAL_ROOT/" "$SSD_ROOT/" \
+    || die "rsync failed; internal files are untouched. Run: mediactl up, then retry sync"
+  verify_copy "$INTERNAL_ROOT" "$SSD_ROOT"
+  echo "Verified. Removing internal copies..."
+  find "$INTERNAL_ROOT/torrents" "$INTERNAL_ROOT/media" -mindepth 1 -delete
+  make_layout "$INTERNAL_ROOT"
+  echo "Restarting stack on the SSD..."
+  cmd_up
+  SYNC_STOPPED=0
+  refresh_apps
+  echo "Sync complete."
+}
+
+# ------------------------------------------------------- archive support
+jellyfin_api() { # jellyfin_api METHOD PATH [JSON]
+  local method=$1 path=$2 body=${3:-} key
+  key=$(env_get JELLYFIN_API_KEY)
+  if [ -z "$key" ]; then die "JELLYFIN_API_KEY is not set in .env"; fi
+  local args=(-fsS -X "$method" -H "X-Emby-Token: $key" -H "Content-Type: application/json")
+  if [ -n "$body" ]; then args+=(-d "$body"); fi
+  "$CURL" "${args[@]}" "http://localhost:8096$path"
+}
+
+# require_archive_ready: needs load_config first.
+require_archive_ready() {
+  if [ -z "$ARCHIVE_ROOT" ]; then die "ARCHIVE_ROOT is not set in .env"; fi
+  if ! is_mounted "$ARCHIVE_ROOT"; then die "archive drive is not mounted ($(volume_of "$ARCHIVE_ROOT"))"; fi
+  # Radarr and Sonarr both move files, so both need the mount (Jellyfin is read-only and optional).
+  local app dest
+  for app in radarr sonarr; do
+    dest=$("$DOCKER" inspect "$app" --format '{{range .Mounts}}{{.Destination}} {{end}}' 2>/dev/null) || dest=""
+    case " $dest " in
+      *" /data/archive "*) ;;
+      *) die "$app does not have the archive mounted; run: mediactl up --archive" ;;
+    esac
+  done
+}
+
+# host_path_for DBPATH RUNNING_ROOT: the host folder behind a Radarr/Sonarr path (empty if unmapped).
+host_path_for() {
+  case "$1" in
+    /data/media/*) printf '%s/media/%s' "$2" "${1#/data/media/}" ;;
+    /data/archive/*) printf '%s/%s' "$ARCHIVE_ROOT" "${1#/data/archive/}" ;;
+  esac
+}
+
+# check_title_folders WORKDIR RUNNING_ROOT DIR: refuse unless every matched title's folder is on
+# a mounted drive; then refuse if the destination drive cannot hold them.
+check_title_folders() {
+  local work=$1 running=$2 dir=$3 path host missing="" total=0 kb
+  local hosts="$work/hosts"; : > "$hosts"
+  while IFS= read -r path; do
+    host=$(host_path_for "$path" "$running")
+    if [ -z "$host" ] || [ ! -d "$host" ]; then
+      missing="$missing
+  $path -> ${host:-(unmapped path)}"
+    else
+      printf '%s\n' "$host" >> "$hosts"
+    fi
+  done < <(cat "$work/radarr.jsonl" "$work/sonarr.jsonl" | jq -r '.path')
+  if [ -n "$missing" ]; then
+    rm -rf "$work"
+    die "these titles are not on a mounted drive, so nothing was changed:$missing
+Plug in the drive and run: ./mediactl up   (then retry)"
+  fi
+  while IFS= read -r host; do
+    kb=$(du -sk "$host" 2>/dev/null | awk '{print $1}')
+    total=$((total + ${kb:-0}))
+  done < "$hosts"
+  local dest_root dest_label free
+  if [ "$dir" = archive ]; then dest_root=$ARCHIVE_ROOT; dest_label="archive drive"
+  else dest_root=$running; dest_label="data drive"; fi
+  free=$(free_kb "$dest_root")
+  case "$free" in ''|*[!0-9]*) rm -rf "$work"; die "could not read free space on the $dest_label (got '$free'); nothing was changed" ;; esac
+  if [ "$total" -gt "$free" ]; then
+    rm -rf "$work"; die "not enough free space on the $dest_label: need ${total}K, have ${free}K; nothing was changed"
+  fi
+}
+
+cmd_init_archive() {
+  load_config
+  require_archive_ready
+  mkdir -p "$ARCHIVE_ROOT/movies" "$ARCHIVE_ROOT/tv"
+  local pair app path n
+  for pair in radarr:/data/archive/movies sonarr:/data/archive/tv; do
+    app=${pair%%:*}; path=${pair#*:}
+    n=$(arr_api "$app" GET /rootfolder | jq --arg p "$path" '[.[] | select(.path == $p or .path == ($p + "/"))] | length')
+    if [ "$n" -gt 0 ]; then
+      echo "$app: root folder $path already present"
+    else
+      arr_api "$app" POST /rootfolder "$(jq -nc --arg p "$path" '{path:$p}')" >/dev/null
+      echo "$app: added root folder $path"
+    fi
+  done
+  if [ -z "$(env_get JELLYFIN_API_KEY)" ]; then
+    echo "JELLYFIN_API_KEY not set: in Jellyfin add /data/archive/movies and /data/archive/tv to your libraries by hand (Dashboard > Libraries)."
+    return 0
+  fi
+  local movies_lib tv_lib folders
+  movies_lib=$(env_get JELLYFIN_MOVIES_LIBRARY Movies); tv_lib=$(env_get JELLYFIN_TV_LIBRARY Shows)
+  folders=$(jellyfin_api GET /Library/VirtualFolders)
+  for pair in "$movies_lib:/data/archive/movies" "$tv_lib:/data/archive/tv"; do
+    local lib=${pair%%:/*} p="/${pair#*:/}"
+    n=$(printf '%s' "$folders" | jq --arg l "$lib" --arg p "$p" '[.[] | select(.Name == $l and (.Locations | index($p)))] | length')
+    if [ "$n" -gt 0 ]; then
+      echo "jellyfin: $p already in library $lib"
+    else
+      jellyfin_api POST "/Library/VirtualFolders/Paths?refreshLibrary=true" \
+        "$(jq -nc --arg l "$lib" --arg p "$p" '{Name:$l, PathInfo:{Path:$p}}')" >/dev/null
+      echo "jellyfin: added $p to library $lib"
+    fi
+  done
+}
+
+# ------------------------------------------------------- archive/restore
+# find_titles APP QUERY PATH_PREFIX: JSON lines for titles where QUERY (case-insensitive)
+# is a substring of the title or of "<title> (<year>)", and whose path starts with PATH_PREFIX.
+find_titles() {
+  local endpoint=movie
+  if [ "$1" = sonarr ]; then endpoint=series; fi
+  arr_api "$1" GET "/$endpoint" | jq -c \
+    --arg q "$(printf '%s' "$2" | tr 'A-Z' 'a-z')" --arg prefix "$3" \
+    '.[] | select(((.title | ascii_downcase | contains($q)) or ((.title + " (" + (.year | tostring) + ")") | ascii_downcase | contains($q))) and (.path | startswith($prefix))) | {id, title, year, path}'
+}
+
+# torrent_hashes APP ID: lowercase info-hashes of releases grabbed for that title.
+torrent_hashes() {
+  local url="/history/movie?movieId=$2&eventType=1"
+  if [ "$1" = sonarr ]; then url="/history/series?seriesId=$2&eventType=1"; fi
+  arr_api "$1" GET "$url" | jq -r '.[].downloadId // empty' | tr 'A-Z' 'a-z' | sort -u
+}
+
+qbit_delete() { # qbit_delete "hash1|hash2"
+  local user pass jar
+  user=$(env_get QBIT_USER); pass=$(env_get QBIT_PASSWORD)
+  if [ -z "$user" ] || [ -z "$pass" ]; then
+    echo "QBIT_USER/QBIT_PASSWORD not set: remove these torrents (with data) in qBittorrent by hand: $1"
+    return 0
+  fi
+  jar=$(mktemp)
+  "$CURL" -fsS -c "$jar" --data-urlencode "username=$user" --data-urlencode "password=$pass" \
+    "http://localhost:5080/api/v2/auth/login" >/dev/null
+  echo "Torrents to be removed (with data):"
+  "$CURL" -fsS -b "$jar" "http://localhost:5080/api/v2/torrents/info?hashes=${1//|/%7C}" \
+    | jq -r '.[]? | "  \(.name)  \(.size) bytes  \(.save_path)"'
+  "$CURL" -fsS -b "$jar" -X POST --data-urlencode "hashes=$1" -d "deleteFiles=true" \
+    "http://localhost:5080/api/v2/torrents/delete" >/dev/null
+  rm -f "$jar"
+  echo "Removed torrent(s) and data from qBittorrent."
+}
+
+# hash_is_exclusive APP HASH IDS_JSON: true only if history confirms the torrent belongs
+# solely to titles in IDS_JSON. Fails closed (prints a skip notice, returns 1) otherwise.
+hash_is_exclusive() {
+  local upper hist verdict
+  upper=$(printf '%s' "$2" | tr 'a-z' 'A-Z')
+  if ! hist=$(arr_api "$1" GET "/history?downloadId=$upper&pageSize=1000"); then
+    echo "skipping $2: could not confirm it belongs only to archived titles"; return 1
+  fi
+  verdict=$(printf '%s' "$hist" | jq -r --argjson ids "$3" '
+    if (type != "object") or ((.records | type) != "array") then "BAD"
+    else .records as $r
+      | (.totalRecords // ($r | length)) as $t
+      | ([$r[] | (.movieId // .seriesId)] | map(select(. != null))) as $o
+      | ([$o[] | select(. as $x | ($ids | index($x)) == null)]) as $other
+      | if $t > ($r | length) then "BAD"
+        elif ($other | length) > 0 then "OTHER:\($other[0])"
+        elif ($o | length) == 0 then "BAD"
+        else "OK" end
+    end' 2>/dev/null) || verdict=BAD
+  case "$verdict" in
+    OK) return 0 ;;
+    OTHER:*) echo "skipping $2: also used by title id ${verdict#OTHER:} that is not being archived"; return 1 ;;
+    *) echo "skipping $2: could not confirm it belongs only to archived titles"; return 1 ;;
+  esac
+}
+
+# wait_for_moves APP...: poll until no queued/started Move command remains.
+# Returns 0 idle, 1 timeout, 2 status unreadable (3 consecutive failed polls).
+wait_for_moves() {
+  local poll=${MEDIACTL_POLL_SECS:-5} timeout=${MEDIACTL_MOVE_TIMEOUT:-900} start=$SECONDS
+  local app busy errs=0 failed n announced=0
+  while true; do
+    busy=0; failed=""
+    for app in "$@"; do
+      if ! n=$(arr_api "$app" GET /command 2>/dev/null | jq '[.[] | select((.status=="queued" or .status=="started") and (.name|test("Move")))] | length' 2>/dev/null) \
+         || [ -z "$n" ] || ! [ "$n" -ge 0 ] 2>/dev/null; then
+        failed=$app; busy=1
+      elif [ "$n" != 0 ]; then
+        busy=1
+      fi
+    done
+    if [ -n "$failed" ]; then errs=$((errs + 1)); else errs=0; fi
+    if [ "$errs" -ge 3 ]; then
+      echo "could not read command status from $failed; torrents left in place"; return 2
+    fi
+    if [ "$busy" -eq 0 ]; then return 0; fi
+    if [ "$announced" -eq 0 ]; then echo "Waiting for Radarr/Sonarr to finish moving files..."; announced=1; fi
+    if [ $((SECONDS - start)) -ge "$timeout" ]; then return 1; fi
+    sleep "$poll"
+  done
+}
+
+ask_yes() { # ask_yes PROMPT: true only on an interactive "y"
+  local reply=""
+  if [ ! -t 0 ]; then return 1; fi
+  read -r -p "$1 [y/N] " reply
+  [ "$reply" = y ] || [ "$reply" = Y ]
+}
+
+cmd_move() {
+  local dir=$1; shift
+  local yes=0 rm_torrents=0 all=0 terms=() arg
+  for arg in "$@"; do
+    case "$arg" in
+      --yes) yes=1 ;;
+      --remove-torrents) rm_torrents=1 ;;
+      --all) all=1 ;;
+      -*) die "unknown option: $arg" ;;
+      *[![:space:]]*) terms+=("$arg") ;;
+      *) die "empty title term: refusing to match everything" ;;
+    esac
+  done
+  if [ "${#terms[@]}" -eq 0 ]; then die "usage: mediactl $dir [--yes] TITLE..."; fi
+  load_config
+  require_archive_ready
+  local from to_movies to_tv
+  if [ "$dir" = archive ]; then
+    from=/data/media/; to_movies=/data/archive/movies; to_tv=/data/archive/tv
+  else
+    from=/data/archive/; to_movies=/data/media/movies; to_tv=/data/media/tv
+  fi
+  local work; work=$(mktemp -d)
+  local term
+  for term in "${terms[@]}"; do
+    find_titles radarr "$term" "$from" >> "$work/radarr.jsonl" || true
+    find_titles sonarr "$term" "$from" >> "$work/sonarr.jsonl" || true
+  done
+  touch "$work/radarr.jsonl" "$work/sonarr.jsonl"
+  sort -u "$work/radarr.jsonl" -o "$work/radarr.jsonl"; sort -u "$work/sonarr.jsonl" -o "$work/sonarr.jsonl"
+  if [ ! -s "$work/radarr.jsonl" ] && [ ! -s "$work/sonarr.jsonl" ]; then
+    rm -rf "$work"; die "no titles matching: ${terms[*]} (under $from)"
+  fi
+  local nm ns
+  nm=$(wc -l < "$work/radarr.jsonl" | tr -d ' '); ns=$(wc -l < "$work/sonarr.jsonl" | tr -d ' ')
+  echo "Matched: $nm movie(s), $ns show(s)"
+  if [ $((nm + ns)) -gt 25 ] && [ "$all" -ne 1 ]; then
+    rm -rf "$work"; die "more than 25 titles matched: narrow the search, or pass --all to confirm"
+  fi
+  local running; running=$(running_data_root)
+  if [ -z "$running" ]; then
+    rm -rf "$work"; die "the stack is not running, so the data root is unknown; run: ./mediactl up"
+  fi
+  check_title_folders "$work" "$running" "$dir"
+  echo "Will $dir:"
+  jq -r '"  movie  [\(.id)] \(.title) (\(.year))  \(.path)"' "$work/radarr.jsonl"
+  jq -r '"  show   [\(.id)] \(.title) (\(.year))  \(.path)"' "$work/sonarr.jsonl"
+  if [ "$yes" -ne 1 ]; then
+    if [ ! -t 0 ]; then rm -rf "$work"; die "not an interactive shell: pass --yes to confirm the list above"; fi
+    if ! ask_yes "Proceed?"; then rm -rf "$work"; echo "Cancelled."; return 0; fi
+  fi
+  acquire_lock
+  local rids sids id
+  rids=$(jq -s -c '[.[].id]' "$work/radarr.jsonl"); sids=$(jq -s -c '[.[].id]' "$work/sonarr.jsonl")
+  : > "$work/hashes_radarr"; : > "$work/hashes_sonarr"
+  if [ "$dir" = archive ]; then
+    for id in $(jq -r '.id' "$work/radarr.jsonl"); do torrent_hashes radarr "$id" >> "$work/hashes_radarr"; done
+    for id in $(jq -r '.id' "$work/sonarr.jsonl"); do torrent_hashes sonarr "$id" >> "$work/hashes_sonarr"; done
+  fi
+  local moved=""
+  if [ "$rids" != "[]" ]; then
+    arr_api radarr PUT /movie/editor "{\"movieIds\":$rids,\"rootFolderPath\":\"$to_movies\",\"moveFiles\":true}" >/dev/null
+    moved="$moved radarr"
+  fi
+  if [ "$sids" != "[]" ]; then
+    arr_api sonarr PUT /series/editor "{\"seriesIds\":$sids,\"rootFolderPath\":\"$to_tv\",\"moveFiles\":true}" >/dev/null
+    moved="$moved sonarr"
+  fi
+  echo "Move requested; Radarr/Sonarr are moving the files (watch Activity in their UI)."
+  if [ "$dir" = archive ] && { [ -s "$work/hashes_radarr" ] || [ -s "$work/hashes_sonarr" ]; }; then
+    local go=0 wait_ok=0 wait_rc=0
+    if [ "$rm_torrents" -eq 1 ] || ask_yes "Remove the matching torrent(s) and data from qBittorrent so SSD space is actually freed?"; then go=1; fi
+    if [ "$go" -ne 1 ]; then
+      echo "Torrent data left in place, so the SSD copy keeps using space. Re-run with --remove-torrents to free it."
+    elif wait_for_moves $moved; then
+      wait_ok=1
+    else
+      wait_rc=$?
+      if [ "$wait_rc" -eq 1 ]; then echo "Moves still running; torrents left in place. Re-run with --remove-torrents later."; fi
+    fi
+    if [ "$wait_ok" -eq 1 ]; then
+      local keep="" h
+      for h in $(sort -u "$work/hashes_radarr"); do
+        if hash_is_exclusive radarr "$h" "$rids"; then keep="$keep
+$h"; fi
+      done
+      for h in $(sort -u "$work/hashes_sonarr"); do
+        if hash_is_exclusive sonarr "$h" "$sids"; then keep="$keep
+$h"; fi
+      done
+      keep=$(printf '%s\n' "$keep" | sed '/^$/d' | sort -u | paste -sd'|' -)
+      if [ -n "$keep" ]; then qbit_delete "$keep"; fi
+    fi
+  fi
+  rm -rf "$work"
+  refresh_apps
+}
+
+# ------------------------------------------------------------- dispatcher
+usage() {
+  cat <<'EOF'
+Usage: mediactl <command> [options]
+  up [--main|--internal|--archive] [--dry-run]   start the stack in the right mode
+  status                                         drives, free space, running mode
+  sync [--yes]                                   move internal-drive media to the SSD
+  init-archive                                   register archive folders in the apps
+  archive [--yes] [--all] [--remove-torrents] TITLE... move titles to the archive drive
+  restore [--yes] [--all] TITLE...                       move titles back from the archive drive
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  if [ $# -gt 0 ]; then shift; fi
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    up) cmd_up "$@" ;;
+    status) cmd_status ;;
+    sync) cmd_sync "$@" ;;
+    init-archive) cmd_init_archive ;;
+    archive) cmd_move archive "$@" ;;
+    restore) cmd_move restore "$@" ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
