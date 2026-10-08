@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# mediactl: start the media stack in the right storage mode and move media
+# between the internal drive, the external SSD and the archive drive.
+# Run `mediactl help` for usage. Sourceable for tests (main only runs when executed).
+set -euo pipefail
+
+MEDIACTL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${MEDIACTL_ENV_FILE:-$MEDIACTL_DIR/.env}"
+DOCKER="${MEDIACTL_DOCKER:-docker}"
+CURL="${MEDIACTL_CURL:-curl}"
+RSYNC="${MEDIACTL_RSYNC:-rsync}"
+LOCK_DIR="${MEDIACTL_LOCK:-${TMPDIR:-/tmp}/mediactl.lock}"
+
+# ---------------------------------------------------------------- helpers
+die() { echo "mediactl: $*" >&2; exit 1; }
+
+# env_get KEY [DEFAULT]: environment wins, then .env, then DEFAULT. Never echoes secrets itself.
+env_get() {
+  local key=$1 def=${2:-} val=""
+  if [ -n "${!key:-}" ]; then printf '%s' "${!key}"; return 0; fi
+  if [ -f "$ENV_FILE" ]; then
+    val=$(grep -E "^${key}=" "$ENV_FILE" | tail -n1 | cut -d= -f2- \
+      | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//") || true
+  fi
+  if [ -n "$val" ]; then printf '%s' "$val"; else printf '%s' "$def"; fi
+}
+
+load_config() {
+  SSD_ROOT=$(env_get DATA_ROOT /Volumes/MediaServer/data)
+  INTERNAL_ROOT=$(env_get INTERNAL_DATA_ROOT "$HOME/media-stack-data")
+  ARCHIVE_ROOT=$(env_get ARCHIVE_ROOT "")
+}
+
+# ------------------------------------------------------- drive detection
+# volume_of PATH: the removable-volume root (/Volumes/<name>) or PATH itself.
+volume_of() {
+  case "$1" in
+    /Volumes/*) local rest=${1#/Volumes/}; printf '/Volumes/%s' "${rest%%/*}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+mount_table() { "${MEDIACTL_MOUNT_CMD:-mount}"; }
+
+# is_mounted PATH: true when the volume holding PATH is mounted. A leftover empty
+# /Volumes/<name> folder does not count; only the mount table does.
+is_mounted() {
+  local vol; vol=$(volume_of "$1")
+  if [ -n "${MEDIACTL_FAKE_MOUNTED+x}" ]; then
+    case ":$MEDIACTL_FAKE_MOUNTED:" in *":$vol:"*) return 0 ;; *) return 1 ;; esac
+  fi
+  case "$vol" in
+    /Volumes/*) mount_table | grep -qF " on $vol (" ;;
+    *) [ -d "$vol" ] ;;
+  esac
+}
+
+# ------------------------------------------------------------- dispatcher
+usage() {
+  cat <<'EOF'
+Usage: mediactl <command> [options]
+  up [--main|--internal|--archive] [--dry-run]   start the stack in the right mode
+  status                                         drives, free space, running mode
+  sync [--yes]                                   move internal-drive media to the SSD
+  init-archive                                   register archive folders in the apps
+  archive [--yes] [--remove-torrents] TITLE...   move titles to the archive drive
+  restore [--yes] TITLE...                       move titles back from the archive drive
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  if [ $# -gt 0 ]; then shift; fi
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
