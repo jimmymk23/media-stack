@@ -399,6 +399,113 @@ cmd_init_archive() {
   done
 }
 
+# ------------------------------------------------------- archive/restore
+# find_titles APP QUERY PATH_PREFIX: JSON lines for titles where QUERY (case-insensitive)
+# is a substring of the title or of "<title> (<year>)", and whose path starts with PATH_PREFIX.
+find_titles() {
+  local endpoint=movie
+  if [ "$1" = sonarr ]; then endpoint=series; fi
+  arr_api "$1" GET "/$endpoint" | jq -c \
+    --arg q "$(printf '%s' "$2" | tr 'A-Z' 'a-z')" --arg prefix "$3" \
+    '.[] | select(((.title | ascii_downcase | contains($q)) or ((.title + " (" + (.year | tostring) + ")") | ascii_downcase | contains($q))) and (.path | startswith($prefix))) | {id, title, year, path}'
+}
+
+# torrent_hashes APP ID: lowercase info-hashes of releases grabbed for that title.
+torrent_hashes() {
+  local url="/history/movie?movieId=$2&eventType=1"
+  if [ "$1" = sonarr ]; then url="/history/series?seriesId=$2&eventType=1"; fi
+  arr_api "$1" GET "$url" | jq -r '.[].downloadId // empty' | tr 'A-Z' 'a-z' | sort -u
+}
+
+qbit_delete() { # qbit_delete "hash1|hash2"
+  local user pass jar
+  user=$(env_get QBIT_USER); pass=$(env_get QBIT_PASSWORD)
+  if [ -z "$user" ] || [ -z "$pass" ]; then
+    echo "QBIT_USER/QBIT_PASSWORD not set: remove these torrents (with data) in qBittorrent by hand: $1"
+    return 0
+  fi
+  jar=$(mktemp)
+  "$CURL" -fsS -c "$jar" --data-urlencode "username=$user" --data-urlencode "password=$pass" \
+    "http://localhost:5080/api/v2/auth/login" >/dev/null
+  "$CURL" -fsS -b "$jar" -X POST --data-urlencode "hashes=$1" -d "deleteFiles=true" \
+    "http://localhost:5080/api/v2/torrents/delete" >/dev/null
+  rm -f "$jar"
+  echo "Removed torrent(s) and data from qBittorrent."
+}
+
+ask_yes() { # ask_yes PROMPT: true only on an interactive "y"
+  local reply=""
+  if [ ! -t 0 ]; then return 1; fi
+  read -r -p "$1 [y/N] " reply
+  [ "$reply" = y ] || [ "$reply" = Y ]
+}
+
+cmd_move() {
+  local dir=$1; shift
+  local yes=0 rm_torrents=0 terms=() arg
+  for arg in "$@"; do
+    case "$arg" in
+      --yes) yes=1 ;;
+      --remove-torrents) rm_torrents=1 ;;
+      -*) die "unknown option: $arg" ;;
+      *) terms+=("$arg") ;;
+    esac
+  done
+  if [ "${#terms[@]}" -eq 0 ]; then die "usage: mediactl $dir [--yes] TITLE..."; fi
+  load_config
+  require_archive_ready
+  local from to_movies to_tv
+  if [ "$dir" = archive ]; then
+    from=/data/media/; to_movies=/data/archive/movies; to_tv=/data/archive/tv
+  else
+    from=/data/archive/; to_movies=/data/media/movies; to_tv=/data/media/tv
+  fi
+  local work; work=$(mktemp -d)
+  local term
+  for term in "${terms[@]}"; do
+    find_titles radarr "$term" "$from" >> "$work/radarr.jsonl" || true
+    find_titles sonarr "$term" "$from" >> "$work/sonarr.jsonl" || true
+  done
+  touch "$work/radarr.jsonl" "$work/sonarr.jsonl"
+  sort -u "$work/radarr.jsonl" -o "$work/radarr.jsonl"; sort -u "$work/sonarr.jsonl" -o "$work/sonarr.jsonl"
+  if [ ! -s "$work/radarr.jsonl" ] && [ ! -s "$work/sonarr.jsonl" ]; then
+    rm -rf "$work"; die "no titles matching: ${terms[*]} (under $from)"
+  fi
+  echo "Will $dir:"
+  jq -r '"  movie  [\(.id)] \(.title) (\(.year))  \(.path)"' "$work/radarr.jsonl"
+  jq -r '"  show   [\(.id)] \(.title) (\(.year))  \(.path)"' "$work/sonarr.jsonl"
+  if [ "$yes" -ne 1 ]; then
+    if [ ! -t 0 ]; then rm -rf "$work"; die "not an interactive shell: pass --yes to confirm the list above"; fi
+    if ! ask_yes "Proceed?"; then rm -rf "$work"; echo "Cancelled."; return 0; fi
+  fi
+  acquire_lock
+  local rids sids hashes="" id
+  rids=$(jq -s -c '[.[].id]' "$work/radarr.jsonl"); sids=$(jq -s -c '[.[].id]' "$work/sonarr.jsonl")
+  if [ "$dir" = archive ]; then
+    for id in $(jq -r '.id' "$work/radarr.jsonl"); do hashes="$hashes
+$(torrent_hashes radarr "$id")"; done
+    for id in $(jq -r '.id' "$work/sonarr.jsonl"); do hashes="$hashes
+$(torrent_hashes sonarr "$id")"; done
+    hashes=$(printf '%s\n' "$hashes" | sed '/^$/d' | sort -u | paste -sd'|' -)
+  fi
+  if [ "$rids" != "[]" ]; then
+    arr_api radarr PUT /movie/editor "{\"movieIds\":$rids,\"rootFolderPath\":\"$to_movies\",\"moveFiles\":true}" >/dev/null
+  fi
+  if [ "$sids" != "[]" ]; then
+    arr_api sonarr PUT /series/editor "{\"seriesIds\":$sids,\"rootFolderPath\":\"$to_tv\",\"moveFiles\":true}" >/dev/null
+  fi
+  echo "Move requested; Radarr/Sonarr are moving the files (watch Activity in their UI)."
+  if [ "$dir" = archive ] && [ -n "$hashes" ]; then
+    if [ "$rm_torrents" -eq 1 ] || ask_yes "Remove the matching torrent(s) and data from qBittorrent so SSD space is actually freed?"; then
+      qbit_delete "$hashes"
+    else
+      echo "Torrent data left in place, so the SSD copy keeps using space. Re-run with --remove-torrents to free it."
+    fi
+  fi
+  rm -rf "$work"
+  refresh_apps
+}
+
 # ------------------------------------------------------------- dispatcher
 usage() {
   cat <<'EOF'
@@ -421,6 +528,8 @@ main() {
     status) cmd_status ;;
     sync) cmd_sync "$@" ;;
     init-archive) cmd_init_archive ;;
+    archive) cmd_move archive "$@" ;;
+    restore) cmd_move restore "$@" ;;
     *) usage >&2; die "unknown command: $cmd" ;;
   esac
 }
