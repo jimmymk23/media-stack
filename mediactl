@@ -196,6 +196,120 @@ cmd_status() {
   fi
 }
 
+# ------------------------------------------------------------------ sync
+release_lock() { rm -rf "$LOCK_DIR"; }
+
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ > "$LOCK_DIR/pid"; trap release_lock EXIT; return 0
+  fi
+  local pid; pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    die "another mediactl is running (pid $pid)"
+  fi
+  rm -rf "$LOCK_DIR"; mkdir "$LOCK_DIR"; echo $$ > "$LOCK_DIR/pid"; trap release_lock EXIT
+}
+
+# macOS ships openrsync, which may not preserve hardlinks; prove it before moving data.
+rsync_preserves_hardlinks() {
+  local d; d=$(mktemp -d)
+  mkdir "$d/src" "$d/dst"
+  echo x > "$d/src/a"; ln "$d/src/a" "$d/src/b"
+  "$RSYNC" -aH "$d/src/" "$d/dst/" >/dev/null 2>&1 || true
+  local ia ib
+  ia=$(stat -f %i "$d/dst/a" 2>/dev/null || echo 1); ib=$(stat -f %i "$d/dst/b" 2>/dev/null || echo 2)
+  rm -rf "$d"
+  [ "$ia" = "$ib" ]
+}
+
+free_kb() { df -k "$(volume_of "$1")" | awk 'NR==2{print $4}'; }
+
+manifest() { # manifest ROOT: sorted "size path" for every file under torrents/ and media/
+  (cd "$1" && { find torrents media -type f -exec stat -f '%z %N' {} + 2>/dev/null || true; } | sort)
+}
+
+verify_copy() { # verify_copy SRC DST: every source file exists at the destination with the same size
+  local missing
+  missing=$(comm -23 <(manifest "$1") <(manifest "$2"))
+  if [ -n "$missing" ]; then
+    die "verification failed, internal copies kept. Differences:
+$missing"
+  fi
+}
+
+wait_for_http() { # wait_for_http URL: up to ~60s
+  local i
+  for i in $(seq 1 30); do
+    if "$CURL" -fsS -o /dev/null "$1" 2>/dev/null; then return 0; fi
+    sleep 2
+  done
+  return 1
+}
+
+# refresh_apps: best-effort rescan so Radarr/Sonarr/Jellyfin notice files that appeared.
+refresh_apps() {
+  local jf; jf=$(env_get JELLYFIN_API_KEY)
+  if [ -n "$(env_get RADARR_API_KEY)" ]; then
+    wait_for_http "http://localhost:7878/ping" || echo "Radarr not reachable yet; rescan it from the UI"
+    arr_api radarr POST /command '{"name":"RescanMovie"}' >/dev/null || echo "Radarr rescan failed; run it from the UI"
+  fi
+  if [ -n "$(env_get SONARR_API_KEY)" ]; then
+    wait_for_http "http://localhost:8989/ping" || echo "Sonarr not reachable yet; rescan it from the UI"
+    arr_api sonarr POST /command '{"name":"RescanSeries"}' >/dev/null || echo "Sonarr rescan failed; run it from the UI"
+  fi
+  if [ -n "$jf" ]; then
+    "$CURL" -fsS -X POST -H "X-Emby-Token: $jf" "http://localhost:8096/Library/Refresh" >/dev/null \
+      || echo "Jellyfin refresh failed; scan libraries from the UI"
+  else
+    echo "JELLYFIN_API_KEY not set: scan Jellyfin libraries from the UI"
+  fi
+}
+
+cmd_sync() {
+  local yes=0 arg
+  for arg in "$@"; do
+    case "$arg" in --yes) yes=1 ;; *) die "unknown option: $arg" ;; esac
+  done
+  load_config
+  if ! is_mounted "$SSD_ROOT"; then
+    die "external SSD is not mounted ($(volume_of "$SSD_ROOT")); nothing to sync to"
+  fi
+  local count
+  count=$( { find "$INTERNAL_ROOT/torrents" "$INTERNAL_ROOT/media" -type f 2>/dev/null || true; } | wc -l | tr -d ' ')
+  if [ "$count" -eq 0 ]; then echo "Nothing to sync: no files under $INTERNAL_ROOT"; return 0; fi
+
+  echo "Will move from $INTERNAL_ROOT to $SSD_ROOT:"
+  list_titles "$INTERNAL_ROOT" | while IFS="$(printf '\t')" read -r kind name; do echo "  [$kind] $name"; done
+  echo "  ($count file(s), including torrent data in torrents/)"
+
+  local need free
+  need=$(du -sk "$INTERNAL_ROOT/torrents" "$INTERNAL_ROOT/media" 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  free=$(free_kb "$SSD_ROOT")
+  if [ "$need" -gt "$free" ]; then
+    die "not enough free space on the SSD: need ${need}K, have ${free}K"
+  fi
+  if ! rsync_preserves_hardlinks; then
+    die "$RSYNC cannot preserve hardlinks. Run: brew install rsync, then set MEDIACTL_RSYNC=\$(brew --prefix)/bin/rsync"
+  fi
+  if [ "$yes" -ne 1 ]; then echo "Dry run only. Re-run with --yes to move."; return 0; fi
+
+  acquire_lock
+  echo "Stopping qbittorrent, radarr, sonarr..."
+  compose_cmd stop qbittorrent radarr sonarr
+  mkdir -p "$SSD_ROOT"
+  echo "Copying (hardlinks preserved)..."
+  "$RSYNC" -aH "$INTERNAL_ROOT/" "$SSD_ROOT/" \
+    || die "rsync failed; internal files are untouched. Run: mediactl up, then retry sync"
+  verify_copy "$INTERNAL_ROOT" "$SSD_ROOT"
+  echo "Verified. Removing internal copies..."
+  find "$INTERNAL_ROOT/torrents" "$INTERNAL_ROOT/media" -mindepth 1 -delete
+  make_layout "$INTERNAL_ROOT"
+  echo "Restarting stack on the SSD..."
+  cmd_up
+  refresh_apps
+  echo "Sync complete."
+}
+
 # ------------------------------------------------------------- dispatcher
 usage() {
   cat <<'EOF'
@@ -216,6 +330,7 @@ main() {
     help|-h|--help) usage ;;
     up) cmd_up "$@" ;;
     status) cmd_status ;;
+    sync) cmd_sync "$@" ;;
     *) usage >&2; die "unknown command: $cmd" ;;
   esac
 }

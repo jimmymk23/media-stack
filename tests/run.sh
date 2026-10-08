@@ -14,9 +14,11 @@ assert_not_contains() { case "$1" in *"$2"*) fail "expected output NOT to contai
 resp() { printf '%s' "$2" > "$TMP/resp/$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
 
 setup_env() {
+  local keep_rsync="${MEDIACTL_RSYNC:-}"
   unset DATA_ROOT INTERNAL_DATA_ROOT ARCHIVE_ROOT RADARR_API_KEY SONARR_API_KEY \
         JELLYFIN_API_KEY JELLYFIN_MOVIES_LIBRARY JELLYFIN_TV_LIBRARY QBIT_USER QBIT_PASSWORD \
         MEDIACTL_MOUNT_CMD MEDIACTL_RSYNC
+  if [ -n "$keep_rsync" ]; then export MEDIACTL_RSYNC="$keep_rsync"; fi
   export HOME="$TMP"
   export MEDIACTL_ENV_FILE="$TMP/.env"
   export MEDIACTL_LOCK="$TMP/lock"
