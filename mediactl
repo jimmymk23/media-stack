@@ -427,10 +427,45 @@ qbit_delete() { # qbit_delete "hash1|hash2"
   jar=$(mktemp)
   "$CURL" -fsS -c "$jar" --data-urlencode "username=$user" --data-urlencode "password=$pass" \
     "http://localhost:5080/api/v2/auth/login" >/dev/null
+  echo "Torrents to be removed (with data):"
+  "$CURL" -fsS -b "$jar" "http://localhost:5080/api/v2/torrents/info?hashes=${1//|/%7C}" \
+    | jq -r '.[]? | "  \(.name)  \(.size) bytes  \(.save_path)"'
   "$CURL" -fsS -b "$jar" -X POST --data-urlencode "hashes=$1" -d "deleteFiles=true" \
     "http://localhost:5080/api/v2/torrents/delete" >/dev/null
   rm -f "$jar"
   echo "Removed torrent(s) and data from qBittorrent."
+}
+
+# hash_is_exclusive APP HASH IDS_JSON: true if no title outside IDS_JSON used this torrent.
+# Prints a skip notice and returns 1 otherwise.
+hash_is_exclusive() {
+  local other hist
+  if ! hist=$(arr_api "$1" GET "/history?downloadId=$2&pageSize=100"); then
+    echo "skipping $2: could not check whether other titles use it"; return 1
+  fi
+  if ! other=$(printf '%s' "$hist" | jq -r --argjson ids "$3" \
+    '(if type=="object" then .records else [] end)[] | (.movieId // .seriesId) | select(. != null) | select(. as $x | ($ids | index($x)) == null)' | head -n1); then
+    echo "skipping $2: could not check whether other titles use it"; return 1
+  fi
+  if [ -n "$other" ]; then
+    echo "skipping $2: also used by title id $other that is not being archived"
+    return 1
+  fi
+  return 0
+}
+
+# wait_for_moves APP...: poll until no queued/started Move command remains. 1 on timeout.
+wait_for_moves() {
+  local poll=${MEDIACTL_POLL_SECS:-5} timeout=${MEDIACTL_MOVE_TIMEOUT:-900} start=$SECONDS app busy
+  while true; do
+    busy=0
+    for app in "$@"; do
+      if [ "$(arr_api "$app" GET /command | jq '[.[] | select((.status=="queued" or .status=="started") and (.name|test("Move")))] | length' 2>/dev/null || echo 0)" != 0 ]; then busy=1; fi
+    done
+    if [ "$busy" -eq 0 ]; then return 0; fi
+    if [ $((SECONDS - start)) -ge "$timeout" ]; then return 1; fi
+    sleep "$poll"
+  done
 }
 
 ask_yes() { # ask_yes PROMPT: true only on an interactive "y"
@@ -442,13 +477,15 @@ ask_yes() { # ask_yes PROMPT: true only on an interactive "y"
 
 cmd_move() {
   local dir=$1; shift
-  local yes=0 rm_torrents=0 terms=() arg
+  local yes=0 rm_torrents=0 all=0 terms=() arg
   for arg in "$@"; do
     case "$arg" in
       --yes) yes=1 ;;
       --remove-torrents) rm_torrents=1 ;;
+      --all) all=1 ;;
       -*) die "unknown option: $arg" ;;
-      *) terms+=("$arg") ;;
+      *[![:space:]]*) terms+=("$arg") ;;
+      *) die "empty title term: refusing to match everything" ;;
     esac
   done
   if [ "${#terms[@]}" -eq 0 ]; then die "usage: mediactl $dir [--yes] TITLE..."; fi
@@ -471,6 +508,12 @@ cmd_move() {
   if [ ! -s "$work/radarr.jsonl" ] && [ ! -s "$work/sonarr.jsonl" ]; then
     rm -rf "$work"; die "no titles matching: ${terms[*]} (under $from)"
   fi
+  local nm ns
+  nm=$(wc -l < "$work/radarr.jsonl" | tr -d ' '); ns=$(wc -l < "$work/sonarr.jsonl" | tr -d ' ')
+  echo "Matched: $nm movie(s), $ns show(s)"
+  if [ $((nm + ns)) -gt 25 ] && [ "$all" -ne 1 ]; then
+    rm -rf "$work"; die "more than 25 titles matched: narrow the search, or pass --all to confirm"
+  fi
   echo "Will $dir:"
   jq -r '"  movie  [\(.id)] \(.title) (\(.year))  \(.path)"' "$work/radarr.jsonl"
   jq -r '"  show   [\(.id)] \(.title) (\(.year))  \(.path)"' "$work/sonarr.jsonl"
@@ -479,27 +522,42 @@ cmd_move() {
     if ! ask_yes "Proceed?"; then rm -rf "$work"; echo "Cancelled."; return 0; fi
   fi
   acquire_lock
-  local rids sids hashes="" id
+  local rids sids id
   rids=$(jq -s -c '[.[].id]' "$work/radarr.jsonl"); sids=$(jq -s -c '[.[].id]' "$work/sonarr.jsonl")
+  : > "$work/hashes_radarr"; : > "$work/hashes_sonarr"
   if [ "$dir" = archive ]; then
-    for id in $(jq -r '.id' "$work/radarr.jsonl"); do hashes="$hashes
-$(torrent_hashes radarr "$id")"; done
-    for id in $(jq -r '.id' "$work/sonarr.jsonl"); do hashes="$hashes
-$(torrent_hashes sonarr "$id")"; done
-    hashes=$(printf '%s\n' "$hashes" | sed '/^$/d' | sort -u | paste -sd'|' -)
+    for id in $(jq -r '.id' "$work/radarr.jsonl"); do torrent_hashes radarr "$id" >> "$work/hashes_radarr"; done
+    for id in $(jq -r '.id' "$work/sonarr.jsonl"); do torrent_hashes sonarr "$id" >> "$work/hashes_sonarr"; done
   fi
+  local moved=""
   if [ "$rids" != "[]" ]; then
     arr_api radarr PUT /movie/editor "{\"movieIds\":$rids,\"rootFolderPath\":\"$to_movies\",\"moveFiles\":true}" >/dev/null
+    moved="$moved radarr"
   fi
   if [ "$sids" != "[]" ]; then
     arr_api sonarr PUT /series/editor "{\"seriesIds\":$sids,\"rootFolderPath\":\"$to_tv\",\"moveFiles\":true}" >/dev/null
+    moved="$moved sonarr"
   fi
   echo "Move requested; Radarr/Sonarr are moving the files (watch Activity in their UI)."
-  if [ "$dir" = archive ] && [ -n "$hashes" ]; then
-    if [ "$rm_torrents" -eq 1 ] || ask_yes "Remove the matching torrent(s) and data from qBittorrent so SSD space is actually freed?"; then
-      qbit_delete "$hashes"
-    else
+  if [ "$dir" = archive ] && { [ -s "$work/hashes_radarr" ] || [ -s "$work/hashes_sonarr" ]; }; then
+    local go=0
+    if [ "$rm_torrents" -eq 1 ] || ask_yes "Remove the matching torrent(s) and data from qBittorrent so SSD space is actually freed?"; then go=1; fi
+    if [ "$go" -ne 1 ]; then
       echo "Torrent data left in place, so the SSD copy keeps using space. Re-run with --remove-torrents to free it."
+    elif ! wait_for_moves $moved; then
+      echo "Moves still running; torrents left in place. Re-run with --remove-torrents later."
+    else
+      local keep="" h
+      for h in $(sort -u "$work/hashes_radarr"); do
+        if hash_is_exclusive radarr "$h" "$rids"; then keep="$keep
+$h"; fi
+      done
+      for h in $(sort -u "$work/hashes_sonarr"); do
+        if hash_is_exclusive sonarr "$h" "$sids"; then keep="$keep
+$h"; fi
+      done
+      keep=$(printf '%s\n' "$keep" | sed '/^$/d' | sort -u | paste -sd'|' -)
+      if [ -n "$keep" ]; then qbit_delete "$keep"; fi
     fi
   fi
   rm -rf "$work"
@@ -514,8 +572,8 @@ Usage: mediactl <command> [options]
   status                                         drives, free space, running mode
   sync [--yes]                                   move internal-drive media to the SSD
   init-archive                                   register archive folders in the apps
-  archive [--yes] [--remove-torrents] TITLE...   move titles to the archive drive
-  restore [--yes] TITLE...                       move titles back from the archive drive
+  archive [--yes] [--all] [--remove-torrents] TITLE... move titles to the archive drive
+  restore [--yes] [--all] TITLE...                       move titles back from the archive drive
 EOF
 }
 

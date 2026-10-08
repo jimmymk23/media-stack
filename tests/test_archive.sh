@@ -130,3 +130,92 @@ test_archive_requires_archive_ready() {
   if out=$( (cmd_move archive Heat --yes) 2>&1 ); then fail "should refuse"; fi
   assert_contains "$out" "mediactl up --archive"
 }
+
+big_movies() { # 26 archivable titles
+  seq 1 26 | jq -R -s -c 'split("\n") | map(select(length>0) | tonumber | {id:., title:("Film "+tostring), year:2000, path:("/data/media/movies/Film "+tostring)})'
+}
+
+test_empty_term_refused_before_any_call() {
+  archive_ready
+  if out=$( (cmd_move archive "" --yes) 2>&1 ); then fail "should refuse"; fi
+  assert_contains "$out" "empty title term"
+  assert_not_contains "$(cat "$TMP/curl.log" 2>/dev/null)" "/api/v3"
+}
+
+test_whitespace_term_refused() {
+  archive_ready
+  if out=$( (cmd_move archive "   " --yes) 2>&1 ); then fail "should refuse"; fi
+  assert_contains "$out" "empty title term"
+  assert_not_contains "$(cat "$TMP/curl.log" 2>/dev/null)" "/movie/editor"
+}
+
+test_match_count_line_is_printed() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  out=$(cmd_move archive Heat --yes)
+  assert_contains "$out" "Matched: 2 movie(s), 0 show(s)"
+}
+
+test_more_than_25_matches_refused_without_all() {
+  archive_ready; resp "GET /api/v3/movie" "$(big_movies)"
+  if out=$( (cmd_move archive Film --yes) 2>&1 ); then fail "should refuse"; fi
+  assert_contains "$out" "--all"
+  assert_not_contains "$(cat "$TMP/curl.log")" "/movie/editor"
+}
+
+test_more_than_25_matches_allowed_with_all() {
+  archive_ready; resp "GET /api/v3/movie" "$(big_movies)"
+  out=$(cmd_move archive Film --yes --all)
+  assert_contains "$out" "Matched: 26 movie(s)"
+  assert_contains "$(cat "$TMP/curl.log")" "/movie/editor"
+}
+
+test_shared_hash_is_skipped_not_deleted() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
+  export MEDIACTL_POLL_SECS=0
+  resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"AAA"},{"downloadId":"BBB"}]'
+  resp "GET /api/v3/history?downloadId=aaa&pageSize=100" '{"records":[{"movieId":1},{"movieId":99}]}'
+  resp "GET /api/v3/history?downloadId=bbb&pageSize=100" '{"records":[{"movieId":1}]}'
+  out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
+  assert_contains "$out" "skipping aaa: also used by title id 99 that is not being archived"
+  log=$(cat "$TMP/curl.log")
+  assert_contains "$log" "hashes=bbb"
+  assert_not_contains "$(grep torrents/delete "$TMP/curl.log"; grep 'hashes=' "$TMP/curl.log")" "aaa"
+}
+
+test_torrent_info_listed_before_delete_and_after_moves() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"; resp "GET /api/v3/series" "$SERIES"
+  printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
+  export MEDIACTL_POLL_SECS=0
+  resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  resp "GET /api/v2/torrents/info?hashes=abc" '[{"name":"Heat.1995.1080p","size":123456,"save_path":"/data/torrents/movies"}]'
+  out=$(cmd_move archive "Heat (1995)" The\ Wire --yes --remove-torrents)
+  assert_contains "$out" "Heat.1995.1080p  123456 bytes  /data/torrents/movies"
+  n_info=$(grep -n 'torrents/info' "$TMP/curl.log" | head -1 | cut -d: -f1)
+  n_del=$(grep -n 'torrents/delete' "$TMP/curl.log" | head -1 | cut -d: -f1)
+  n_put1=$(grep -n 'movie/editor' "$TMP/curl.log" | head -1 | cut -d: -f1)
+  n_put2=$(grep -n 'series/editor' "$TMP/curl.log" | head -1 | cut -d: -f1)
+  [ "$n_info" -lt "$n_del" ] || fail "info must precede delete"
+  [ "$n_put1" -lt "$n_del" ] && [ "$n_put2" -lt "$n_del" ] || fail "delete must follow both editor PUTs"
+}
+
+test_stuck_move_leaves_torrents_in_place() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
+  export MEDIACTL_POLL_SECS=0 MEDIACTL_MOVE_TIMEOUT=0
+  resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  resp "GET /api/v3/command" '[{"name":"MoveMovie","status":"started"}]'
+  out=$(cmd_move archive "Heat (1995)" --yes --remove-torrents)
+  assert_contains "$out" "Moves still running; torrents left in place. Re-run with --remove-torrents later."
+  assert_not_contains "$(cat "$TMP/curl.log")" "torrents/delete"
+}
+
+test_idle_command_queue_allows_delete() {
+  archive_ready; resp "GET /api/v3/movie" "$MOVIES"
+  printf 'QBIT_USER=u\nQBIT_PASSWORD=p\n' >> "$TMP/.env"
+  export MEDIACTL_POLL_SECS=0 MEDIACTL_MOVE_TIMEOUT=0
+  resp "GET /api/v3/history/movie?movieId=1&eventType=1" '[{"downloadId":"ABC"}]'
+  resp "GET /api/v3/command" '[{"name":"RefreshMovie","status":"started"},{"name":"MoveMovie","status":"completed"}]'
+  cmd_move archive "Heat (1995)" --yes --remove-torrents >/dev/null
+  assert_contains "$(cat "$TMP/curl.log")" "torrents/delete"
+}
