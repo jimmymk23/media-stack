@@ -45,3 +45,17 @@ test_arr_api_requires_key() {
   if out=$( (arr_api radarr GET /movie) 2>&1 ); then fail "should fail without key"; fi
   assert_contains "$out" "RADARR_API_KEY is not set"
 }
+
+test_dashboard_once_shows_sections_and_vpn_warning() {
+  out=$(cmd_dashboard --once)
+  assert_contains "$out" "Storage"
+  assert_contains "$out" "Containers"
+  assert_contains "$out" "qBittorrent IP: unreachable"
+}
+
+test_dashboard_rejects_bad_options() {
+  if out=$( (cmd_dashboard --interval abc) 2>&1 ); then fail "bad interval"; fi
+  assert_contains "$out" "--interval needs a positive number"
+  if out=$( (cmd_dashboard --bogus) 2>&1 ); then fail "unknown flag"; fi
+  assert_contains "$out" "unknown option: --bogus"
+}
