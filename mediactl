@@ -20,7 +20,13 @@ env_get() {
   if [ -n "${!key:-}" ]; then printf '%s' "${!key}"; return 0; fi
   if [ -f "$ENV_FILE" ]; then
     val=$(grep -E "^${key}=" "$ENV_FILE" | tail -n1 | cut -d= -f2- \
-      | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//") || true
+      | sed -e 's/^[[:space:]]*//') || true
+    # Like compose/dotenv: an unquoted value ends at " #" (or is empty if it starts with "#").
+    case "$val" in
+      \"*|\'*) val=$(printf '%s' "$val" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//") ;;
+      \#*) val="" ;;
+      *) val=$(printf '%s' "$val" | sed -e 's/[[:space:]][[:space:]]*#.*$//' -e 's/[[:space:]]*$//') ;;
+    esac
   fi
   if [ -n "$val" ]; then printf '%s' "$val"; else printf '%s' "$def"; fi
 }
@@ -120,6 +126,18 @@ cmd_up() {
   (cd "$MEDIACTL_DIR" && "${cmd[@]}")
 }
 
+# stop [--down]: stop the stack (containers kept); --down also removes them.
+# Takes the lock so it cannot interrupt a running sync/archive/restore.
+cmd_stop() {
+  local action=stop arg
+  for arg in "$@"; do
+    case "$arg" in --down) action=down ;; *) die "unknown option: $arg" ;; esac
+  done
+  acquire_lock
+  # Include the recommendarr profile so it is stopped too if it was started.
+  (cd "$MEDIACTL_DIR" && "$DOCKER" compose --profile vpn --profile recommendarr "$action")
+}
+
 # ------------------------------------------------------------ app APIs
 arr_url() {
   case "$1" in
@@ -155,7 +173,13 @@ list_titles() {
 
 count_kind() { list_titles "$1" | awk -F'\t' -v k="$2" '$1==k{n++} END{print n+0}'; }
 
-free_space() { df -hP "$(volume_of "$1")" | awk 'NR==2{print $4}'; }
+# free_space PATH: human-readable free space. (macOS df -P overrides -h, so format from KB ourselves.)
+free_space() {
+  df -kP "$(volume_of "$1")" | awk 'NR==2{
+    k=$4; split("K M G T P", u, " "); i=1
+    while (k>=1024 && i<5) { k/=1024; i++ }
+    printf (k>=100||i==1 ? "%.0f%s" : "%.1f%s"), k, u[i] }'
+}
 
 running_data_root() {
   "$DOCKER" inspect radarr \
@@ -171,7 +195,7 @@ drive_line() { # drive_line LABEL PATH
   else
     state="NOT MOUNTED"
   fi
-  printf '%-9s %-40s %-12s free %-6s movies %-4s tv %s\n' "$label" "$path" "$state" "$free" "$movies" "$shows"
+  printf '%-9s %-42s %-12s free %-7s movies %-4s tv %s\n' "$label" "$path" "$state" "$free" "$movies" "$shows"
 }
 
 cmd_status() {
@@ -195,6 +219,95 @@ cmd_status() {
     n=$((n + ${c:-0}))
     if [ "$n" -gt 0 ]; then echo "Archived titles offline: $n (plug in the archive drive and run: mediactl up)"; fi
   fi
+}
+
+# ------------------------------------------------------------- dashboard
+# colorize CODE TEXT: ANSI color when stdout is a terminal and NO_COLOR is unset.
+colorize() {
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi
+}
+
+# public_ip [exec-container]: public IP as seen from the host or from inside a container.
+public_ip() {
+  if [ -n "${1:-}" ]; then
+    "$DOCKER" exec "$1" curl -s --max-time 4 https://ipinfo.io/ip 2>/dev/null || true
+  else
+    "$CURL" -s --max-time 4 https://ipinfo.io/ip 2>/dev/null || true
+  fi
+}
+
+IP_CHECKED_AT=0; VPN_IP=""; HOST_IP=""
+# refresh_ips: re-check the public IPs at most once a minute (they need network calls).
+refresh_ips() {
+  local now; now=$(date +%s)
+  if [ "$IP_CHECKED_AT" -ne 0 ] && [ $((now - IP_CHECKED_AT)) -lt 60 ]; then return 0; fi
+  VPN_IP=$(public_ip qbittorrent); HOST_IP=$(public_ip)
+  IP_CHECKED_AT=$now
+}
+
+dash_containers() {
+  local rows svc state health line
+  rows=$(cd "$MEDIACTL_DIR" && "$DOCKER" compose --profile vpn --profile recommendarr ps -a \
+    --format '{{.Service}}|{{.State}}|{{.Health}}' 2>/dev/null) || rows=""
+  if [ -z "$rows" ]; then echo "  (no containers; run: mediactl up)"; return 0; fi
+  while IFS='|' read -r svc state health; do
+    [ -n "$svc" ] || continue
+    line="${state}${health:+ ($health)}"
+    if [ "$state" = running ] && { [ -z "$health" ] || [ "$health" = healthy ]; }; then
+      printf '  %-14s %s\n' "$svc" "$(colorize 32 "$line")"
+    else
+      printf '  %-14s %s\n' "$svc" "$(colorize 31 "$line")"
+    fi
+  done <<< "$rows"
+}
+
+dash_vpn() {
+  refresh_ips
+  if [ -z "$VPN_IP" ]; then
+    echo "  qBittorrent IP: $(colorize 31 'unreachable (tunnel down or qBittorrent stopped)')"
+  elif [ -n "$HOST_IP" ] && [ "$VPN_IP" = "$HOST_IP" ]; then
+    echo "  qBittorrent IP: $VPN_IP  $(colorize 31 'WARNING: same as your host IP, not protected')"
+  else
+    echo "  qBittorrent IP: $VPN_IP  $(colorize 32 'via VPN') (host: ${HOST_IP:-unknown})"
+  fi
+}
+
+# dash_frame: one full dashboard frame on stdout.
+dash_frame() {
+  echo "$(colorize 1 'Media stack') - $(date '+%Y-%m-%d %H:%M:%S')"
+  echo
+  echo "$(colorize 1 Storage)"
+  cmd_status | sed 's/^/  /'
+  echo
+  echo "$(colorize 1 Containers)"
+  dash_containers
+  echo
+  echo "$(colorize 1 VPN)"
+  dash_vpn
+}
+
+# dashboard [--once] [--interval SECS]: live view; q or Ctrl+C quits.
+cmd_dashboard() {
+  local once=0 interval=5
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --once) once=1 ;;
+      --interval) shift; interval=${1:-}; case "$interval" in ''|*[!0-9]*|0) die "--interval needs a positive number" ;; esac ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  load_config
+  if [ "$once" -eq 1 ] || [ ! -t 1 ]; then dash_frame; return 0; fi
+  trap 'tput cnorm 2>/dev/null; echo' EXIT
+  tput civis 2>/dev/null || true
+  local key=""
+  while true; do
+    # Build the frame first, then paint it in one go so the screen does not flicker.
+    local frame; frame=$(dash_frame)
+    printf '\033[H\033[2J%s\n\n%s\n' "$frame" "$(colorize 2 "refreshing every ${interval}s - press q to quit")"
+    if read -r -s -n 1 -t "$interval" key && [ "$key" = q ]; then break; fi
+  done
 }
 
 # ------------------------------------------------------------------ sync
@@ -679,6 +792,8 @@ usage() {
   cat <<'EOF'
 Usage: mediactl <command> [options]
   up [--main|--internal|--archive] [--dry-run]   start the stack in the right mode
+  stop [--down]                                  stop the stack (--down also removes containers)
+  dashboard [--once] [--interval SECS]           live terminal dashboard (q quits)
   status                                         drives, free space, running mode
   sync [--yes]                                   move internal-drive media to the SSD
   init-archive                                   register archive folders in the apps
@@ -693,6 +808,8 @@ main() {
   case "$cmd" in
     help|-h|--help) usage ;;
     up) cmd_up "$@" ;;
+    stop) cmd_stop "$@" ;;
+    dashboard) cmd_dashboard "$@" ;;
     status) cmd_status ;;
     sync) cmd_sync "$@" ;;
     init-archive) cmd_init_archive ;;
