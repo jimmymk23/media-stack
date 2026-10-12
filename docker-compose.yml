@@ -229,36 +229,120 @@ services:
     restart: unless-stopped
   
   
-  # Doc: https://github.com/navilg/cleanmyarr
-  # cleanmyarr:
-  #   profiles: ["vpn", "no-vpn"]
-  #   depends_on:
-  #     - radarr
-  #     - sonarr
-  #   image: linuxshots/cleanmyarr:0.8.1
-  #   container_name: cleanmyarr
-  #   networks:
-  #     - mynetwork
-  #   volumes:
-  #     - cleanmyarr-config:/config
-    # restart: unless-stopped
-    # environment:
-    # - CMA_MAINTENANCE_CYCLE=${CMA_MAINTENANCE_CYCLE:-""}
-    # - CMA_DELETE_AFTER_DAYS=${CMA_DELETE_AFTER_DAYS:-""}
-    # - CMA_ENABLE_EMAIL_NOTIFICATION=${CMA_ENABLE_EMAIL_NOTIFICATION:-""}
-    # - CMA_SMTP_USERNAME=${CMA_SMTP_USERNAME:-""}
-    # - CMA_SMTP_ENCODED_PASSWORD=${CMA_SMTP_ENCODED_PASSWORD:-""}
-    # - CMA_SMTP_TO_EMAILS=${CMA_SMTP_TO_EMAILS:-""}
-    # - CMA_ENABLE_GOTIFY_NOTIFICATION=${CMA_ENABLE_GOTIFY_NOTIFICATION:-""}
-    # - CMA_GOTIFY_URL=${CMA_GOTIFY_URL:-""}
-    # - CMA_GOTIFY_ENCODED_APP_TOKEN=${CMA_GOTIFY_ENCODED_APP_TOKEN:-""}
-    # - CMA_ENABLE_TELEGRAM_NOTIFICATION=${CMA_ENABLE_TELEGRAM_NOTIFICATION:-""}
-    # - CMA_TELEGRAM_ENCODED_BOT_TOKEN=${CMA_TELEGRAM_ENCODED_BOT_TOKEN:-""}
-    # - CMA_TELEGRAM_CHAT_ID=${CMA_TELEGRAM_CHAT_ID:-""}
-    # - CMA_MONITOR_RADARR=${CMA_MONITOR_RADARR:-""}
-    # - CMA_RADARR_URL=${CMA_RADARR_URL:-""}
-    # - CMA_RADARR_ENCODED_API_KEY=${CMA_RADARR_ENCODED_API_KEY:-""}
-    # - CMA_RADARR_ENABLE_NOTIFICATION=${CMA_RADARR_ENABLE_NOTIFICATION:-""}
+  # ---------------------------------------------------------------------------
+  # Automation add-ons (all in the vpn/no-vpn profiles, so `mediactl up` starts them).
+  # They need RADARR_API_KEY / SONARR_API_KEY in .env (Settings > General > API Key).
+  # ---------------------------------------------------------------------------
+
+  # FlareSolverr: solves Cloudflare challenges for Prowlarr indexers.
+  # Shares gluetun's network namespace like Prowlarr does, so in Prowlarr use
+  # http://localhost:8191 (Settings > Indexers > Add Indexer Proxy > FlareSolverr, tag "flaresolverr").
+  # VPN mode only: it has no port of its own because it lives inside the vpn container's network.
+  flaresolverr:
+    profiles: ["vpn"]
+    container_name: flaresolverr
+    image: ghcr.io/flaresolverr/flaresolverr:v3.5.2
+    depends_on:
+      vpn:
+        condition: service_healthy
+    network_mode: service:vpn
+    environment:
+      - TZ=UTC
+      - LOG_LEVEL=info
+    restart: unless-stopped
+
+  # Recyclarr: syncs TRaSH Guides quality profiles and custom formats into Radarr/Sonarr.
+  # First start writes a template to /config/recyclarr.yml; edit it, then run:
+  #   docker exec recyclarr recyclarr sync
+  # (it also re-syncs on CRON_SCHEDULE). See "Configure Recyclarr" in the README.
+  recyclarr:
+    profiles: ["vpn", "no-vpn"]
+    container_name: recyclarr
+    image: ghcr.io/recyclarr/recyclarr:8.7.3
+    depends_on:
+      - radarr
+      - sonarr
+    networks:
+      - mynetwork
+    environment:
+      - TZ=UTC
+      - CRON_SCHEDULE=@daily
+      - RECYCLARR_CREATE_CONFIG=true
+      - RADARR_API_KEY=${RADARR_API_KEY:-}
+      - SONARR_API_KEY=${SONARR_API_KEY:-}
+    volumes:
+      - recyclarr-config:/config
+    restart: unless-stopped
+
+  # Bazarr: subtitles for everything Radarr/Sonarr manage.
+  # It must see the same media paths as Radarr/Sonarr (/data/media/...); archived titles
+  # (/data/archive) are added by docker-compose.archive.yml.
+  bazarr:
+    profiles: ["vpn", "no-vpn"]
+    container_name: bazarr
+    image: lscr.io/linuxserver/bazarr:1.6.2
+    depends_on:
+      - radarr
+      - sonarr
+    networks:
+      - mynetwork
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      - UMASK=002
+    volumes:
+      - bazarr-config:/config
+      - ${DATA_ROOT:-/Volumes/MediaServer/data}/media:/data/media
+    ports:
+      - 6767:6767
+    restart: unless-stopped
+
+  # Unpackerr: extracts RAR/ZIP releases so Radarr/Sonarr can import them.
+  # Needs the same /data/torrents path as qBittorrent, Radarr and Sonarr.
+  unpackerr:
+    profiles: ["vpn", "no-vpn"]
+    container_name: unpackerr
+    image: ghcr.io/unpackerr/unpackerr:0.16.1
+    user: "1000:1000"
+    depends_on:
+      - radarr
+      - sonarr
+    networks:
+      - mynetwork
+    environment:
+      - TZ=UTC
+      - UN_FILE_MODE=0664
+      - UN_DIR_MODE=0775
+      - UN_RADARR_0_URL=http://radarr:7878
+      - UN_RADARR_0_API_KEY=${RADARR_API_KEY:-}
+      - UN_RADARR_0_PATHS_0=/data/torrents/movies
+      - UN_SONARR_0_URL=http://sonarr:8989
+      - UN_SONARR_0_API_KEY=${SONARR_API_KEY:-}
+      - UN_SONARR_0_PATHS_0=/data/torrents/tv
+    volumes:
+      - ${DATA_ROOT:-/Volumes/MediaServer/data}/torrents:/data/torrents
+    restart: unless-stopped
+
+  # Maintainerr: rule-based cleanup of unwatched/old media (replaces cleanmyarr).
+  # Configure at http://localhost:6246 (Settings: Jellyfin, Radarr, Sonarr, Seerr).
+  maintainerr:
+    profiles: ["vpn", "no-vpn"]
+    container_name: maintainerr
+    image: ghcr.io/maintainerr/maintainerr:3.30.1
+    depends_on:
+      - radarr
+      - sonarr
+      - jellyfin
+    networks:
+      - mynetwork
+    environment:
+      - TZ=UTC
+    volumes:
+      - maintainerr-data:/opt/data
+    ports:
+      - 6246:6246
+    restart: unless-stopped
 
 volumes:
   gluetun-data:
@@ -269,7 +353,9 @@ volumes:
   qbittorrent-config:
   seerr-config:
   recommendarr-data:
-  # cleanmyarr-config:
+  recyclarr-config:
+  bazarr-config:
+  maintainerr-data:
 
 networks:
   mynetwork:

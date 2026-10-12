@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A Docker Compose definition of a self-hosted media stack (gluetun VPN, qBittorrent, Prowlarr, Radarr, Sonarr, Seerr, Jellyfin, optional Recommendarr). There is no application code, build, or test suite — the deliverable is `docker-compose.yml` plus optional reverse-proxy files (`docker-compose-nginx.yml` + `nginx.conf`, or `docker-compose-traefik.yml`).
+A Docker Compose definition of a self-hosted media stack (gluetun VPN, qBittorrent, Prowlarr, Radarr, Sonarr, Seerr, Jellyfin, plus add-ons FlareSolverr, Recyclarr, Bazarr, Unpackerr, Maintainerr, and optional Recommendarr). There is no application code, build, or test suite — the deliverable is `docker-compose.yml` plus optional reverse-proxy files (`docker-compose-nginx.yml` + `nginx.conf`, or `docker-compose-traefik.yml`).
 
 This is a personal fork of `navilg/media-stack`, running on macOS (Docker Desktop) with the VPN **enabled** and media stored on an external SSD. The fork's local changes (VPN on, `DATA_ROOT` bind mounts, `UMASK`, gluetun WireGuard/port-forwarding options) diverge from upstream, so the README's setup steps are partly stale — see "README drift" below.
 
@@ -49,6 +49,8 @@ Running `docker compose` **without a profile deploys nothing** — every service
 - Other containers reach them via the `vpn` hostname: qBittorrent at `vpn:5080`, Prowlarr at `vpn:9696`.
 - Prowlarr *cannot* resolve other container names, so Radarr and Sonarr get static IPs on `mynetwork` (`RADARR_STATIC_CONTAINER_IP`, `SONARR_STATIC_CONTAINER_IP`) and Prowlarr's app config points at those IPs. Pick IPs high in the subnet (e.g. `.100`, `.101`): Docker hands out low addresses dynamically to other containers first, and a clash leaves the container stuck in "Created" with `Address already in use`.
 - Containers not behind the VPN (Radarr, Sonarr, Seerr, Jellyfin) talk to each other by service name on `mynetwork`.
+
+**Add-on services.** Recyclarr, Bazarr, Unpackerr and Maintainerr are in the `vpn`/`no-vpn` profiles (so `mediactl up` starts them) and sit on `mynetwork`, reaching Radarr/Sonarr by service name. Recyclarr and Unpackerr read `RADARR_API_KEY`/`SONARR_API_KEY` from `.env` (the same keys `mediactl` uses). FlareSolverr is `vpn`-profile only and uses `network_mode: service:vpn` like Prowlarr, so Prowlarr reaches it at `http://localhost:8191/`. Bazarr mounts only `media` (plus `/data/archive` via `docker-compose.archive.yml`); Unpackerr mounts only `torrents`. Paths must stay identical to Radarr/Sonarr's (`/data/media/...`, `/data/torrents/...`) or imports and subtitle lookups break. Maintainerr replaces the old commented-out cleanmyarr block. App-side setup is in the README ("Configure the add-ons").
 
 **Storage layout (hardlink-friendly, TRaSH-style).** One host directory, `DATA_ROOT` (default `/Volumes/MediaServer/data`, the external SSD), holds `torrents/{movies,tv,...}` and `media/{movies,tv,...}`:
 - Radarr and Sonarr mount all of `DATA_ROOT` at `/data`, so imports from `/data/torrents/*` into `/data/media/*` are hardlinks on the same filesystem, not copies. Keep it that way; splitting these into separate mounts breaks hardlinking.

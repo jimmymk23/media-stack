@@ -7,6 +7,9 @@ services:
   sonarr:
     volumes:
       - ${ARCHIVE_ROOT:?ARCHIVE_ROOT is not set}:/data/archive
+  bazarr:
+    volumes:
+      - ${ARCHIVE_ROOT:?ARCHIVE_ROOT is not set}:/data/archive
   jellyfin:
     volumes:
       - ${ARCHIVE_ROOT:?ARCHIVE_ROOT is not set}:/data/archive:ro
