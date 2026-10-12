@@ -55,6 +55,8 @@ Container paths are the same in every mode, so Radarr, Sonarr and Jellyfin need 
 | Command | What it does |
 |---------|--------------|
 | `./mediactl up [--main\|--internal\|--archive] [--dry-run]` | Start the stack in the detected (or forced) mode |
+| `./mediactl stop [--down]` | Stop the stack, keeping containers (`--down` also removes them; config volumes are kept). Restart with `./mediactl up` |
+| `./mediactl dashboard [--once] [--interval SECS]` | Live terminal dashboard: drives, container health, VPN IP check. Refreshes every 5s; `q` quits |
 | `./mediactl status` | Drives, free space, running mode, pending sync |
 | `./mediactl sync [--yes]` | Move internal-drive media to the SSD. Dry run by default; verifies the copy before deleting internal files |
 | `./mediactl init-archive` | One-time: register the archive folders in Radarr, Sonarr and Jellyfin |

@@ -43,3 +43,15 @@ test_die_exits_nonzero_with_message() {
   if out=$( (die "boom") 2>&1 ); then fail "die should exit nonzero"; fi
   assert_contains "$out" "mediactl: boom"
 }
+
+test_env_inline_comments_and_blank_values() {
+  printf 'ARCHIVE_ROOT=  # /Volumes/Archive/x\nDATA_ROOT=/a/b # note\nINTERNAL_DATA_ROOT="/c # d"\n' > "$TMP/.env"
+  assert_eq "" "$(env_get ARCHIVE_ROOT)"
+  assert_eq "/a/b" "$(env_get DATA_ROOT)"
+  assert_eq "/c # d" "$(env_get INTERNAL_DATA_ROOT)"
+}
+
+test_free_space_is_human_readable() {
+  out=$(free_space "$TMP")
+  case "$out" in *[KMGTP]) ;; *) fail "expected unit suffix, got [$out]" ;; esac
+}

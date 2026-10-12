@@ -25,6 +25,8 @@ COMPOSE_PROFILES=vpn,recommendarr docker compose up -d   # with Recommendarr
 
 # Preferred: start in the right storage mode for whichever drives are mounted
 ./mediactl up                 # main (SSD) / internal fallback, + archive if mounted
+./mediactl stop [--down]      # stop the stack (all profiles); --down removes containers
+./mediactl dashboard          # live view (drives, containers, VPN IP); --once for a single frame
 ./mediactl status             # drives, free space, running mode, pending sync
 ./mediactl sync [--yes]       # move internal-drive media to the SSD (dry run by default)
 ./mediactl init-archive       # one-time: archive root folders in Radarr/Sonarr/Jellyfin

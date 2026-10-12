@@ -71,3 +71,15 @@ test_archive_override_is_valid_yaml_with_expected_mounts() {
   grep -q 'jellyfin:' "$f" || fail "jellyfin"
   grep -q '/data/archive:ro' "$f" || fail "jellyfin must mount read-only"
 }
+
+test_stop_calls_compose_stop_with_all_profiles() {
+  cmd_stop >/dev/null
+  assert_contains "$(cat "$TMP/docker.log")" "compose --profile vpn --profile recommendarr stop"
+}
+
+test_stop_down_flag_and_unknown_option() {
+  cmd_stop --down >/dev/null
+  assert_contains "$(cat "$TMP/docker.log")" "compose --profile vpn --profile recommendarr down"
+  if out=$( (cmd_stop --bogus) 2>&1 ); then fail "unknown flag"; fi
+  assert_contains "$out" "unknown option: --bogus"
+}
