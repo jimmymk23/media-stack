@@ -391,16 +391,14 @@ Only needed when an indexer in Prowlarr fails with a Cloudflare error. FlareSolv
 
 ### Recyclarr (TRaSH quality profiles)
 
-Recyclarr syncs TRaSH Guides quality profiles and custom formats into Radarr and Sonarr from a YAML file in its `recyclarr-config` volume. It does nothing useful until you edit that file.
+Recyclarr syncs TRaSH Guides quality profiles and custom formats into Radarr and Sonarr. The config is tracked in this repo at `recyclarr/media-stack.yml` and mounted read-only into the container, so there is nothing to create by hand. It defines the 1080p profiles **HD Bluray + WEB** (Radarr) and **WEB-1080p** (Sonarr); API keys come from `.env` via `!env_var`.
 
-1. Start the stack, then check that a template was created: `docker exec recyclarr ls /config`
-2. List the available TRaSH templates: `docker exec recyclarr recyclarr config list templates`
-3. Create a config from a template (example): `docker exec recyclarr recyclarr config create -t radarr-quality-profile-hd-bluray-web` and the Sonarr equivalent from the list.
-4. Edit the file in the volume. Use `base_url: http://radarr:7878` and `http://sonarr:8989`, and `api_key: !env_var RADARR_API_KEY` / `!env_var SONARR_API_KEY` (the container already has both variables).
-5. Preview, then apply: `docker exec recyclarr recyclarr sync --preview`, then `docker exec recyclarr recyclarr sync`
-6. After that it re-syncs daily (`CRON_SCHEDULE=@daily`).
+1. Edit `recyclarr/media-stack.yml` (see https://recyclarr.dev and the TRaSH Guides for profile and custom-format IDs). For 4K, swap in the `remux-web-2160p` or `uhd-bluray-web` template contents.
+2. Apply it: `docker exec recyclarr recyclarr sync`. It also re-syncs daily (`CRON_SCHEDULE=@daily`).
+3. A sync only creates and updates the TRaSH profiles; it never changes which profile a movie or show uses. Do that in Radarr/Sonarr (Mass Editor) or Seerr (Settings --> Services --> default profile).
+4. Before moving existing titles onto a new profile, check their files: a profile that does not allow a file's quality (for example Remux or Bluray in WEB-1080p) can make the app replace it with a lower-quality copy.
 
-> The command names above are from Recyclarr 7.x. This stack pins 8.x, so if one is rejected, run `docker exec recyclarr recyclarr --help` and check https://recyclarr.dev.
+> The config format follows Recyclarr 8.x, which this stack pins. If a keyword is rejected, run `docker exec recyclarr recyclarr --help`.
 
 ### Bazarr (subtitles)
 

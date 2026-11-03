@@ -266,11 +266,12 @@ services:
     environment:
       - TZ=UTC
       - CRON_SCHEDULE=@daily
-      - RECYCLARR_CREATE_CONFIG=true
+      - RECYCLARR_CREATE_CONFIG=false # the profile config is mounted below; the starter template would not work
       - RADARR_API_KEY=${RADARR_API_KEY:-}
       - SONARR_API_KEY=${SONARR_API_KEY:-}
     volumes:
       - recyclarr-config:/config
+      - ./recyclarr/media-stack.yml:/config/configs/media-stack.yml:ro # TRaSH profiles, tracked in this repo
     restart: unless-stopped
 
   # Bazarr: subtitles for everything Radarr/Sonarr manage.
