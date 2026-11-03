@@ -14,6 +14,12 @@ This stack includes:
 - **Seerr:** To manage media requests
 - **Jellyfin:** Open-source media streamer
 - **Recommendarr:** For AI-powered movie and show recommendations
+- **FlareSolverr:** Gets Prowlarr past Cloudflare-protected indexers (VPN mode)
+- **Recyclarr:** Syncs TRaSH Guides quality profiles into Radarr/Sonarr
+- **Bazarr:** Subtitle management for Radarr/Sonarr
+- **Unpackerr:** Extracts RAR/ZIP downloads so they can be imported
+- **Maintainerr:** Rule-based cleanup of old or unwatched media
+- **Homarr:** Dashboard linking to every service in the stack
 
 ## Requirements
 
@@ -296,7 +302,7 @@ COMPOSE_PROFILES=vpn,recommendarr docker compose up -d  # With VPN
 ## Setup order
 
 Configure the apps in this order, since each step uses what the previous one set up:
-**qBittorrent → Radarr → Sonarr → Prowlarr → Jellyfin → Seerr**.
+**qBittorrent → Radarr → Sonarr → Prowlarr → Jellyfin → Seerr**, then the add-ons (see "Configure the add-ons").
 
 | App | URL |
 |---|---|
@@ -306,6 +312,9 @@ Configure the apps in this order, since each step uses what the previous one set
 | Sonarr | http://localhost:8989 |
 | Jellyfin | http://localhost:8096 |
 | Seerr | http://localhost:5055 |
+| Bazarr | http://localhost:6767 |
+| Maintainerr | http://localhost:6246 |
+| Homarr | http://localhost:7575 |
 
 ## Configure qBittorrent
 
@@ -366,6 +375,71 @@ Configure Sonarr in a similar way, with these differences:
 - Add Sonarr: hostname `sonarr`, port `8989`, API key, root folder `/data/media/tv`, and enable Season Folders.
 - Follow the Seerr document for detailed setup - https://docs.seerr.dev/
 
+## Configure the add-ons
+
+These services start with the rest of the stack (`./mediactl up` or `docker compose --profile vpn up -d`). All of them need `RADARR_API_KEY` and `SONARR_API_KEY` set in `.env` first (Radarr/Sonarr: Settings --> General --> API Key). After editing `.env`, re-run `./mediactl up` so the containers pick the keys up.
+
+### FlareSolverr (Cloudflare-protected indexers)
+
+Only needed when an indexer in Prowlarr fails with a Cloudflare error. FlareSolverr runs inside the VPN container's network (like Prowlarr), so Prowlarr reaches it on `localhost`.
+
+1. Open Prowlarr at http://localhost:9696
+2. Settings --> Indexers --> Add (+) --> **FlareSolverr**
+3. Name: `FlareSolverr`, Tags: `flaresolverr`, Host: `http://localhost:8191/`
+4. Test and Save
+5. Edit the failing indexer and add the tag `flaresolverr`, then Test and Save.
+
+### Recyclarr (TRaSH quality profiles)
+
+Recyclarr syncs TRaSH Guides quality profiles and custom formats into Radarr and Sonarr. The config is tracked in this repo at `recyclarr/media-stack.yml` and mounted read-only into the container, so there is nothing to create by hand. It defines the 1080p profiles **HD Bluray + WEB** (Radarr) and **WEB-1080p** (Sonarr); API keys come from `.env` via `!env_var`.
+
+1. Edit `recyclarr/media-stack.yml` (see https://recyclarr.dev and the TRaSH Guides for profile and custom-format IDs). For 4K, swap in the `remux-web-2160p` or `uhd-bluray-web` template contents.
+2. Apply it: `docker exec recyclarr recyclarr sync`. It also re-syncs daily (`CRON_SCHEDULE=@daily`).
+3. A sync only creates and updates the TRaSH profiles; it never changes which profile a movie or show uses. Do that in Radarr/Sonarr (Mass Editor) or Seerr (Settings --> Services --> default profile).
+4. Before moving existing titles onto a new profile, check their files: a profile that does not allow a file's quality (for example Remux or Bluray in WEB-1080p) can make the app replace it with a lower-quality copy.
+
+> The config format follows Recyclarr 8.x, which this stack pins. If a keyword is rejected, run `docker exec recyclarr recyclarr --help`.
+
+### Bazarr (subtitles)
+
+1. Open Bazarr at http://localhost:6767
+2. Settings --> Radarr --> enable, Address `radarr`, Port `7878`, API key --> Test and Save
+3. Settings --> Sonarr --> enable, Address `sonarr`, Port `8989`, API key --> Test and Save
+4. Settings --> Languages --> add your language(s) under Languages Filter, then create a Languages Profile and set it as default for Series and Movies
+5. Settings --> Providers --> enable at least one (for example OpenSubtitles.com, which needs a free account)
+6. No path mapping is needed: Bazarr sees the same `/data/media/...` paths as Radarr and Sonarr. Archived titles (`/data/archive`) work only when the archive drive is mounted, because `mediactl up` adds it.
+
+### Unpackerr (RAR releases)
+
+Unpackerr is configured entirely from `docker-compose.yml`: it watches `/data/torrents/movies` and `/data/torrents/tv` and extracts archives that Radarr/Sonarr report as downloaded. There is no web UI. Check it with `docker logs unpackerr`; you should see Radarr and Sonarr connect.
+
+### Maintainerr (automatic cleanup, replaces cleanmyarr)
+
+1. Open Maintainerr at http://localhost:6246
+2. Settings --> Jellyfin: URL `http://jellyfin:8096`, API key (Jellyfin: Dashboard --> API Keys --> +)
+3. Settings --> Radarr: Hostname `radarr`, Port `7878`, API key. Settings --> Sonarr: Hostname `sonarr`, Port `8989`, API key.
+4. Settings --> Seerr: URL `http://seerr:5055`, API key (Seerr: Settings --> General)
+5. Rules --> create a rule (for example "not watched in 180 days"), pick an action and a grace period
+6. Leave the collection on **dry run / manual** at first and review what it would remove before letting it delete anything.
+
+Deleting a title through Radarr/Sonarr removes the media copy, but a seeding torrent keeps its own hardlink to the data, so disk space is freed only when the torrent is removed from qBittorrent too.
+
+### Homarr (dashboard)
+
+1. Open Homarr at http://localhost:7575 and create the admin account.
+2. Add apps/integrations using container names: Radarr `http://radarr:7878`, Sonarr `http://sonarr:8989`, Jellyfin `http://jellyfin:8096`, Seerr `http://seerr:5055`, Bazarr `http://bazarr:6767`, Maintainerr `http://maintainerr:6246`. qBittorrent and Prowlarr sit behind the VPN container, so use `http://vpn:5080` and `http://vpn:9696`.
+3. Set each app's *external* link to its `http://localhost:PORT` address so the tiles open in your browser.
+4. `HOMARR_SECRET_ENCRYPTION_KEY` in `.env` encrypts the API keys Homarr stores. Keep it: if it changes, saved integrations must be re-entered. The Docker socket is intentionally not mounted.
+
+### Jellyfin plugins
+
+Install in Jellyfin at http://localhost:8096 --> Dashboard --> Plugins. Restart Jellyfin after installing: `docker restart jellyfin`, then hard-refresh the browser.
+
+1. **Playback Reporting** and **Trakt**: Catalog tab --> search the name --> Install. (Both are in Jellyfin's default catalog.)
+2. **Intro Skipper**: Repositories tab --> + --> Name `Intro Skipper`, URL `https://intro-skipper.org/manifest.json` --> Save. Catalog tab --> Intro Skipper --> Install. It needs Jellyfin 10.11.11 or newer, which this stack pins, and the `linuxserver/jellyfin` image already includes the ffmpeg it needs. Analysis runs as a scheduled task (Dashboard --> Scheduled Tasks) and takes a while on a large library.
+3. **Jellyfin Enhanced**: Repositories tab --> + --> Name `Jellyfin Enhanced`, URL `https://raw.githubusercontent.com/n00bcodr/jellyfin-plugins/main/manifest.json` --> Save. Catalog tab --> Jellyfin Enhanced --> Install. After the restart, press `?` in the Jellyfin web UI; if the Enhanced panel opens it works. Connect Seerr in the plugin's settings (URL `http://seerr:5055` and its API key) to get requests from inside Jellyfin.
+4. Optional: the **File Transformation** plugin (`https://www.iamparadox.dev/jellyfin/plugins/manifest.json`) unlocks extra UI features in Intro Skipper and Jellyfin Enhanced. Both work without it.
+
 ## Troubleshooting
 
 - **A container won't start with `permission denied` on `/host_mnt/Volumes/...`:** the external drive isn't mounted. Plug it in and re-run `docker compose --profile vpn up -d`.
@@ -374,6 +448,8 @@ Configure Sonarr in a similar way, with these differences:
 - **Seerr warns "The `/app/config` volume mount was not configured properly":** the image's marker file was copied into the volume. Your data is saved. Remove the warning with `docker exec seerr rm /app/config/DOCKER`.
 - **Radarr/Sonarr log `429 Too Many Requests` from an indexer:** the indexer is rate-limiting you. Radarr retries on the next search.
 - **Prowlarr or qBittorrent has no internet:** the VPN is down. Check `docker logs vpn`.
+- **Recyclarr, Bazarr or Unpackerr can't connect to Radarr/Sonarr (401):** `RADARR_API_KEY`/`SONARR_API_KEY` are empty or wrong in `.env`. Fix them and re-run `./mediactl up`.
+- **FlareSolverr unreachable from Prowlarr:** use `http://localhost:8191/` (not a container name), and recreate it after any VPN container recreate: `docker compose --profile vpn up -d`.
 
 ## Configure Recommendarr
 
