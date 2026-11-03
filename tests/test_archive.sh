@@ -379,3 +379,10 @@ test_archive_refuses_when_free_space_unreadable() {
   assert_contains "$out" "free space"
   assert_not_contains "$(cat "$TMP/curl.log" 2>/dev/null || true)" "/editor"
 }
+
+test_jellyfin_uses_mediabrowser_authorization_header() {
+  printf 'JELLYFIN_API_KEY=jk\n' >> "$TMP/.env"
+  jellyfin_api GET /Library/VirtualFolders >/dev/null
+  assert_contains "$(cat "$TMP/curl.log")" 'Authorization: MediaBrowser Token="jk"'
+  assert_not_contains "$(cat "$TMP/curl.log")" "X-Emby-Token"
+}
