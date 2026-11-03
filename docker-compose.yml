@@ -343,6 +343,26 @@ services:
       - 6246:6246
     restart: unless-stopped
 
+  # Homarr: dashboard that links to (and can show status of) every service in the stack.
+  # Configure at http://localhost:7575. Add integrations using container names on mynetwork
+  # (radarr:7878, sonarr:8989, jellyfin:8096, seerr:5055), except qBittorrent (vpn:5080) and
+  # Prowlarr (vpn:9696), which sit behind the VPN container. The Docker socket is deliberately
+  # not mounted (it gives the container root-equivalent access to the host).
+  homarr:
+    profiles: ["vpn", "no-vpn"]
+    container_name: homarr
+    image: ghcr.io/homarr-labs/homarr:v2.10.1
+    networks:
+      - mynetwork
+    environment:
+      - TZ=UTC
+      - SECRET_ENCRYPTION_KEY=${HOMARR_SECRET_ENCRYPTION_KEY:?set HOMARR_SECRET_ENCRYPTION_KEY in .env (openssl rand -hex 32)}
+    volumes:
+      - homarr-appdata:/appdata
+    ports:
+      - 7575:7575
+    restart: unless-stopped
+
 volumes:
   gluetun-data:
   radarr-config:
@@ -355,6 +375,7 @@ volumes:
   recyclarr-config:
   bazarr-config:
   maintainerr-data:
+  homarr-appdata:
 
 networks:
   mynetwork:

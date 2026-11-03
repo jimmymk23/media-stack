@@ -19,6 +19,7 @@ This stack includes:
 - **Bazarr:** Subtitle management for Radarr/Sonarr
 - **Unpackerr:** Extracts RAR/ZIP downloads so they can be imported
 - **Maintainerr:** Rule-based cleanup of old or unwatched media
+- **Homarr:** Dashboard linking to every service in the stack
 
 ## Requirements
 
@@ -313,6 +314,7 @@ Configure the apps in this order, since each step uses what the previous one set
 | Seerr | http://localhost:5055 |
 | Bazarr | http://localhost:6767 |
 | Maintainerr | http://localhost:6246 |
+| Homarr | http://localhost:7575 |
 
 ## Configure qBittorrent
 
@@ -423,6 +425,13 @@ Unpackerr is configured entirely from `docker-compose.yml`: it watches `/data/to
 6. Leave the collection on **dry run / manual** at first and review what it would remove before letting it delete anything.
 
 Deleting a title through Radarr/Sonarr removes the media copy, but a seeding torrent keeps its own hardlink to the data, so disk space is freed only when the torrent is removed from qBittorrent too.
+
+### Homarr (dashboard)
+
+1. Open Homarr at http://localhost:7575 and create the admin account.
+2. Add apps/integrations using container names: Radarr `http://radarr:7878`, Sonarr `http://sonarr:8989`, Jellyfin `http://jellyfin:8096`, Seerr `http://seerr:5055`, Bazarr `http://bazarr:6767`, Maintainerr `http://maintainerr:6246`. qBittorrent and Prowlarr sit behind the VPN container, so use `http://vpn:5080` and `http://vpn:9696`.
+3. Set each app's *external* link to its `http://localhost:PORT` address so the tiles open in your browser.
+4. `HOMARR_SECRET_ENCRYPTION_KEY` in `.env` encrypts the API keys Homarr stores. Keep it: if it changes, saved integrations must be re-entered. The Docker socket is intentionally not mounted.
 
 ### Jellyfin plugins
 
